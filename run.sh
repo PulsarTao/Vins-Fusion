@@ -49,7 +49,15 @@ MODEL=${MODEL:-x500_depth_vinsfusion}
 AIRFRAME=${AIRFRAME:-4002}
 IMAGE=${IMAGE:-vins-ros2:humble-amd64}
 CONTAINER=${CONTAINER:-vins-ros2-local}
-PX4_DIR=${PX4_DIR:-/home/pulsarv/workspace/GroundControl/PX4-Autopilot}
+# PX4 位置：优先用环境变量，其次探测几个常见路径
+#   用法: PX4_DIR=/your/path/PX4-Autopilot ./run.sh
+if [ -z "${PX4_DIR:-}" ]; then
+    for _d in "$HOME/workspace/GroundControl/PX4-Autopilot" \
+              "$HOME/PX4-Autopilot" "$HOME/src/PX4-Autopilot" "/opt/PX4-Autopilot"; do
+        [ -d "$_d" ] && { PX4_DIR="$_d"; break; }
+    done
+    PX4_DIR=${PX4_DIR:-$HOME/PX4-Autopilot}
+fi
 ROOTFS=${ROOTFS:-$HOME/.vins_gz_rootfs}
 LOG=${LOG:-/tmp/vins_sim}
 VINS_CFG=/ros2_ws/vins_config/gz_sim/gz_mono_imu.yaml
