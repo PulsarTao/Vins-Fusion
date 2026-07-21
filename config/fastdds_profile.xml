@@ -1,10 +1,37 @@
 <?xml version="1.0" encoding="UTF-8" ?>
+<!-- =============================================================================
+     FastDDS 传输配置 —— 仅供【容器内】的 VINS 使用
+
+     ⚠ 千万不要在宿主机侧也加载这个 profile：
+        它禁用了共享内存(useBuiltinTransports=false 后只剩 UDPv4)，
+        而同机进程走共享内存快一倍。实测宿主机 seeker_split_node：
+            加载本 profile    ->  9.2 Hz
+            不加载(默认 SHM)  -> 20.1 Hz
+        正确用法是：宿主机不设，只在容器内设。
+
+     为什么容器内必须用 UDP-only：
+        宿主机与容器的共享内存段互不可见，DDS 会出现
+        「话题列表看得到、数据一条收不到」的现象。强制走 UDPv4 才能跨容器传输。
+
+     buffer 调大的原因：
+        一帧 544x640 mono8 = 350KB，UDP 分片要 200+ 个包，
+        默认 buffer 会大量丢片导致重组失败 —— 实测图像只有 6.4 Hz
+        (同时 IMU 因为消息小，稳定 200Hz，可见问题只出在大消息)。
+        这里把收发 buffer 提到 16MB，给分片留足空间。
+        若仍不理想，需要放开内核上限：
+            sudo sysctl -w net.core.rmem_max=16777216
+            sudo sysctl -w net.core.wmem_max=16777216
+     ============================================================================= -->
 <dds>
     <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
         <transport_descriptors>
             <transport_descriptor>
                 <transport_id>udp_transport</transport_id>
                 <type>UDPv4</type>
+                <!-- 单个 UDP 数据报上限 64KB(协议限制)，大图像会被切片 -->
+                <maxMessageSize>65500</maxMessageSize>
+                <sendBufferSize>16777216</sendBufferSize>
+                <receiveBufferSize>16777216</receiveBufferSize>
             </transport_descriptor>
         </transport_descriptors>
 

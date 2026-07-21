@@ -6,6 +6,10 @@
 #    ./run.sh                启动完整仿真
 #    ./run.sh --headless     无 GUI（省资源，适合跑批量测试）
 #    ./run.sh takeoff        让无人机起飞（VINS 需要运动才能初始化）
+#
+#  本地真实相机（不用仿真）:
+#    ./run.sh local seeker   seeker1 四目鱼眼环视相机（双目+IMU）
+#    ./run.sh local d435i    RealSense D435i（双目+IMU）
 #    ./run.sh status         查看各环节状态
 #    ./run.sh logs [名称]    查看日志: gz|px4|bridge|vins|rviz
 #    ./run.sh stop           停止全部
@@ -149,12 +153,13 @@ stop_all() {
     info "停止仿真..."
     # 用 [x] 写法：否则 pkill -f 会匹配到承载它自己的命令行，把自己先杀掉
     ps -eo pid,args --no-headers 2>/dev/null \
-      | grep -E "[g]z sim|[p]x4 |[p]arameter_bridge|[f]ly_pattern" \
+      | grep -E "[g]z sim|[p]x4 |[p]arameter_bridge|[s]eeker_node" \
       | awk '{print $1}' | while read -r p; do kill -9 "$p" 2>/dev/null; done
 
     docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER" && \
       docker exec "$CONTAINER" bash -c '
-        ps -eo pid,args --no-headers | grep -E "[v]ins_node|[r]viz2" \
+        ps -eo pid,args --no-headers \
+          | grep -E "[v]ins_node|[r]viz2|[r]ealsense2_camera|[d]435i_publisher" \
           | awk "{print \$1}" | while read p; do kill -9 $p 2>/dev/null; done
         exit 0' >/dev/null 2>&1
 
@@ -209,6 +214,160 @@ show_status() {
     echo "── 资源 ──"
     echo "  负载: $(load_now) / ${NPROC}核    内存: $(free -h | awk '/^Mem:/{print $3"/"$2}')"
     echo "════════════════════════════════"
+}
+
+# ============================================================ 本地真实相机
+ensure_container() {
+    docker ps --format '{{.Names}}' | grep -qx "$CONTAINER" && return 0
+    info "创建容器 $CONTAINER ..."
+    docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    docker run -d --name "$CONTAINER" --init --privileged --net=host --ipc=host \
+        -e DISPLAY="${DISPLAY:-:0}" -e QT_X11_NO_MITSHM=1 \
+        -e __NV_PRIME_RENDER_OFFLOAD=1 -e __GLX_VENDOR_LIBRARY_NAME=nvidia \
+        -v /tmp/.X11-unix:/tmp/.X11-unix:rw -v /dev:/dev -v /run/udev:/run/udev:ro \
+        -v "$HOME/vins_output:/root/output" \
+        "$IMAGE" sleep infinity >/dev/null
+    sleep 3
+    ok "容器已创建"
+}
+
+stop_local() {
+    # 宿主机侧的相机驱动与去畸变节点。
+    # 用 [x] 括号写法匹配自身进程名之外的进程：否则这条 grep 会匹配到承载它的
+    # 那个 shell，把自己 kill 掉，表现成「相机突然坏了」，很难查。
+    ps -eo pid,args --no-headers 2>/dev/null \
+      | grep -E "[s]eeker_node|[s]eeker_split_node|[s]eeker1|[p]arameter_bridge" \
+      | awk '{print $1}' | while read -r p; do kill -9 "$p" 2>/dev/null; done
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER" && \
+      docker exec "$CONTAINER" bash -c '
+        ps -eo pid,args --no-headers \
+          | grep -E "[v]ins_node|[r]viz2|[r]ealsense2_camera|[d]435i_publisher" \
+          | awk "{print \$1}" | while read p; do kill -9 $p 2>/dev/null; done
+        exit 0' >/dev/null 2>&1
+    sleep 2
+}
+
+# seeker1 四目鱼眼环视相机
+#   驱动 + 去畸变节点跑在宿主机(都是 ROS2 包，colcon build 即可)，VINS 跑在容器里。
+#
+#   两个反直觉但实测确认的点，改之前先读：
+#   1) 宿主机侧【绝不能】设 FASTRTPS_DEFAULT_PROFILES_FILE。
+#      那个 profile 关掉了共享内存，同机进程通信会腰斩：20.1Hz -> 9.2Hz。
+#      它只该在容器内设(跨容器共享内存不通，必须走 UDP)。
+#   2) 中间必须有 seeker_split_node。驱动原始的 /fisheye/*/image_raw 是
+#      bgr8 1088x1280 单帧 4.18MB，DDS 传不动(2~8Hz)；而且是鱼眼，
+#      VINS 的 MEI 反投影在 xi=3.22 时会开负数根输出 NaN。
+#      该节点从 /all/compressed 解码、切片、去畸变成针孔，发 /cam0 /cam1。
+do_local_seeker() {
+    local use_rviz=true
+    for a in "$@"; do [ "$a" = "--no-rviz" ] && use_rviz=false; done
+
+    mkdir -p "$LOG"
+    lsusb 2>/dev/null | grep -q "2207:0000" || die "未检测到 seeker1 相机(USB 2207:0000)"
+    ok "seeker1 相机已连接"
+
+    # 工作区用软链指向项目源码，避免源码两份不同步
+    local ws="$HERE/.seeker_ws"
+    mkdir -p "$ws/src"
+    [ -L "$ws/src/seeker1" ] || { rm -rf "$ws/src/seeker1"; \
+        ln -s ../../ros2_ws_src/seeker1 "$ws/src/seeker1"; }
+
+    # 源码比产物新就重编，否则改了代码不生效很难查
+    local bin="$ws/install/seeker/lib/seeker/seeker_split_node"
+    if [ ! -x "$bin" ] || \
+       [ -n "$(find "$HERE/ros2_ws_src/seeker1" -newer "$bin" -name '*.cpp' -o \
+               -newer "$bin" -name '*.h' -o -newer "$bin" -name 'CMakeLists.txt' 2>/dev/null)" ]; then
+        info "编译 seeker 驱动与去畸变节点..."
+        ( cd "$ws" && set +u && source /opt/ros/humble/setup.bash && set -u && \
+          colcon build --packages-select seeker --cmake-args -DCMAKE_BUILD_TYPE=Release ) \
+          > "$LOG/seeker_build.log" 2>&1 \
+          || { err "编译失败，见 $LOG/seeker_build.log"; tail -10 "$LOG/seeker_build.log"; exit 1; }
+        ok "编译完成"
+    fi
+
+    # 标定：直接从相机读出厂值(Kalibr 格式)，不是估计
+    if [ ! -f "$HERE/config/seeker/seeker_remap.yaml" ]; then
+        info "生成标定与去畸变配置..."
+        python3 "$HERE/scripts/gen_seeker_config.py" \
+          || { err "标定生成失败"; exit 1; }
+    fi
+
+    ensure_container
+    stop_local >/dev/null 2>&1
+    xhost +local:docker >/dev/null 2>&1 || true
+
+    # 见函数头注释第 1 点：宿主机必须【不带】profile
+    unset FASTRTPS_DEFAULT_PROFILES_FILE
+
+    info "启动 seeker 驱动..."
+    ( cd "$ws" && set +u && source /opt/ros/humble/setup.bash && source install/setup.bash && set -u && \
+      nohup ros2 launch seeker 1seeker.launch.py > "$LOG/seeker.log" 2>&1 & )
+
+    source_ros
+    unset FASTRTPS_DEFAULT_PROFILES_FILE
+    info "等待相机出图与 IMU..."
+    local n=0 img_ok=false imu_ok=false
+    while [ $n -lt 60 ]; do
+        sleep 3; n=$((n+3))
+        $img_ok || timeout 6 ros2 topic echo /all/compressed --once --field format \
+            >/dev/null 2>&1 && img_ok=true
+        $imu_ok || timeout 6 ros2 topic echo /imu_data_raw --once --field header \
+            >/dev/null 2>&1 && imu_ok=true
+        $img_ok && $imu_ok && break
+    done
+    $img_ok && ok "相机出图正常" || { err "无图像数据"; tail -10 "$LOG/seeker.log"; exit 1; }
+    $imu_ok && ok "IMU 正常"  || warn "无 IMU 数据 —— VINS 需要 IMU，请检查驱动 pub_imu 参数"
+
+    info "启动去畸变节点（鱼眼 → 矫正双目针孔）..."
+    ( cd "$ws" && set +u && source /opt/ros/humble/setup.bash && source install/setup.bash && set -u && \
+      nohup ros2 run seeker seeker_split_node --ros-args \
+        -p remap_file:="$HERE/config/seeker/seeker_remap.yaml" \
+        > "$LOG/seeker_split.log" 2>&1 & )
+    sleep 5
+    timeout 8 ros2 topic echo /cam0/image_raw --once --field encoding >/dev/null 2>&1 \
+        && ok "/cam0 /cam1 已就绪" \
+        || { err "去畸变节点无输出"; tail -15 "$LOG/seeker_split.log"; exit 1; }
+
+    docker cp "$HERE/config/seeker/." "$CONTAINER:/ros2_ws/vins_config/seeker/" >/dev/null 2>&1 || true
+    docker cp "$HERE/config/fastdds_profile.xml" "$CONTAINER:/ros2_ws/vins_config/" >/dev/null 2>&1 || true
+    docker cp "$HERE/config/vins_rviz2.rviz" "$CONTAINER:/ros2_ws/vins_config/" >/dev/null 2>&1 || true
+
+    info "启动 VINS-Fusion（矫正双目 + IMU）..."
+    docker exec -d -e FASTRTPS_DEFAULT_PROFILES_FILE=$DDS_PROFILE "$CONTAINER" \
+        /ros_entrypoint.sh bash -c \
+        "ros2 run vins vins_node /ros2_ws/vins_config/seeker/seeker_stereo_imu.yaml > /root/output/vins.log 2>&1"
+    sleep 12
+    docker exec "$CONTAINER" pgrep -f vins_node >/dev/null 2>&1 \
+        && ok "VINS 运行中" || warn "VINS 未启动，查看: ./run.sh logs vins"
+
+    if $use_rviz; then
+        info "启动 rviz2..."
+        docker exec -d -e DISPLAY="${DISPLAY:-:0}" -e FASTRTPS_DEFAULT_PROFILES_FILE=$DDS_PROFILE \
+            -e __NV_PRIME_RENDER_OFFLOAD=1 -e __GLX_VENDOR_LIBRARY_NAME=nvidia "$CONTAINER" \
+            /ros_entrypoint.sh bash -c "rviz2 -d /ros2_ws/vins_config/vins_rviz2.rviz > /root/output/rviz.log 2>&1"
+        sleep 8
+    fi
+
+    echo
+    echo "────────────────────────────────────────────────────────"
+    ok "seeker 环视相机 VINS 已启动（负载 $(load_now)/${NPROC}核）"
+    echo
+    echo -e "  ${C_Y}下一步${C_N}：拿起相机【缓慢平移】几秒，轨迹才会出现"
+    echo "     别原地纯旋转 —— 纯旋转没有视差，三角化不出深度"
+    echo
+    echo "  相机: front 矫正双目(物理鱼眼 left+right，基线 4.6cm) + IMU"
+    echo "        鱼眼已去畸变为 640x480 针孔，视场 90°x74°"
+    echo "  状态: ./run.sh status   日志: ./run.sh logs vins   停止: ./run.sh stop"
+    echo "────────────────────────────────────────────────────────"
+}
+
+do_local() {
+    local target="${1:-}"; shift 2>/dev/null || true
+    case "$target" in
+        seeker|seeker1)        do_local_seeker "$@" ;;
+        d435i|realsense_d435i) exec "$HERE/run_local_d435i.sh" "$@" ;;
+        *) die "用法: ./run.sh local <seeker|d435i> [--no-rviz]" ;;
+    esac
 }
 
 # ============================================================ 起飞
@@ -389,7 +548,7 @@ do_start() {
     echo "────────────────────────────────────────────────────────"
     ok "仿真已启动（负载 $(load_now) / ${NPROC}核）"
     echo
-    echo "  ${C_Y}下一步${C_N}：VINS 需要【运动】才能初始化（单目 VIO 靠视差三角化）"
+    echo -e "  ${C_Y}下一步${C_N}：VINS 需要【运动】才能初始化（单目 VIO 靠视差三角化）"
     echo "     ./run.sh takeoff      让无人机起飞"
     echo
     echo "  查看状态: ./run.sh status"
@@ -402,6 +561,7 @@ do_start() {
 case "${1:-start}" in
     start)          shift 2>/dev/null || true; do_start "$@" ;;
     --headless|-H)  do_start --headless ;;
+    local)          shift 2>/dev/null || true; do_local "$@" ;;
     takeoff|fly)    do_takeoff ;;
     stop)           stop_all ;;
     restart)        stop_all; sleep 2; do_start ;;
