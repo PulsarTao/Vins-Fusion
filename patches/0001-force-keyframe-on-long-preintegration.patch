@@ -1,0 +1,64 @@
+diff --git a/vins/src/estimator/estimator.cpp b/vins/src/estimator/estimator.cpp
+index ac014af..63a48d5 100755
+--- a/vins/src/estimator/estimator.cpp
++++ b/vins/src/estimator/estimator.cpp
+@@ -470,6 +470,43 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
+         //printf("non-keyframe\n");
+     }
+ 
++    // -------------------------------------------------------------------------
++    // 本地补丁：滑窗停滞太久就强制产生关键帧
++    //
++    // 上游只用视差决定关键帧。相机静止时视差 ~= 0，于是每帧都走
++    // MARGIN_SECOND_NEW —— 这个分支只丢弃「次新帧」，窗口里 0..frame_count-2
++    // 这些帧被【冻结】，永远不再更新。后果有两个，第二个才是致命的：
++    //
++    //   1) IMU 预积分无界增长。slideWindow() 把新帧的 IMU 采样并入
++    //      pre_integrations[frame_count-1]（见本文件 slideWindow 内的
++    //      push_back），相机不动就一直并，sum_dt 一路涨，jacobian 超过 1e8
++    //      触发 "numerical unstable in preintegration"。
++    //
++    //   2) 特征饥饿（这才是发散的直接原因）。冻结的那些帧不再接收新观测，
++    //      新特征只能落在最后一个槽位上，攒不够 4 次观测；而优化器只用
++    //      used_num >= 4 的特征(见本文件 optimization() 内的判据)。老特征
++    //      随跟踪丢失逐个消亡后，参与优化的特征数变成 0，视觉约束彻底消失，
++    //      VINS 退化为纯 IMU 递推。实测静置桌面 5 分钟漂了 7.5 公里，
++    //      调试输出里 feat 一栏稳定为 0。
++    //
++    // 只调 keyframe_parallax 治不了本：那等于指望像素噪声或场景里有人走动去
++    // 超过阈值，画面真正静止时依然失效（实测阈值降到 0.3 照样漂公里级）。
++    //
++    // 关键是索引要对：真正无限增长的是 pre_integrations[frame_count - 1]
++    // （合并的目标），而不是 pre_integrations[frame_count]（它每帧都被重建，
++    // 恒等于一个图像周期，检查它等于没检查）。
++    //
++    // 0.5s 的取值：滑窗 10 帧，上限 0.5s 意味着窗口最长覆盖 5 秒，
++    // 零偏引起的位置误差 0.5*b*0.25 是厘米量级，优化器能正常吸收。
++    // 真实运动时每帧视差本就远超阈值，这条分支根本不会触发，对正常工况无影响。
++    // -------------------------------------------------------------------------
++    if (marginalization_flag == MARGIN_SECOND_NEW && USE_IMU && frame_count >= 1 &&
++        pre_integrations[frame_count - 1] != nullptr &&
++        pre_integrations[frame_count - 1]->sum_dt > MAX_KEYFRAME_INTERVAL)
++    {
++        marginalization_flag = MARGIN_OLD;
++    }
++
+     ROS_DEBUG("%s", marginalization_flag ? "Non-keyframe" : "Keyframe");
+     ROS_DEBUG("Solving %d", frame_count);
+     ROS_DEBUG("number of feature: %d", f_manager.getFeatureCount());
+diff --git a/vins/src/estimator/parameters.h b/vins/src/estimator/parameters.h
+index 34685c7..6b20955 100755
+--- a/vins/src/estimator/parameters.h
++++ b/vins/src/estimator/parameters.h
+@@ -29,6 +29,11 @@ const int WINDOW_SIZE = 10;
+ const int NUM_OF_F = 1000;
+ //#define UNIT_SPHERE_ERROR
+ 
++// 本地补丁：单个预积分区间的时长上限(秒)。超过就强制产生关键帧。
++// 上游只按视差判定关键帧，相机静止时视差 ~= 0 会导致预积分无限累积，
++// 加速度计零偏被 sum_dt² 放大，位置按平方发散。详见 estimator.cpp 中的说明。
++const double MAX_KEYFRAME_INTERVAL = 0.5;
++
+ extern double INIT_DEPTH;
+ extern double MIN_PARALLAX;
+ extern int ESTIMATE_EXTRINSIC;

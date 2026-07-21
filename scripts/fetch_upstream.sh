@@ -22,8 +22,33 @@ PINNED=72023bc
 USE_LATEST=false
 [ "${1:-}" = "--latest" ] && USE_LATEST=true
 
+PATCH_DIR="$ROOT/patches"
+
+# 本项目对上游的必要改动放在 patches/，clone 之后统一打上。
+# 不直接把改过的源码提交进仓库，是为了保持「上游代码 + 可审查的差异」这种形式：
+# 换上游版本时能立刻看出哪些改动需要重新适配。
+apply_patches() {
+    [ -d "$PATCH_DIR" ] || return 0
+    local p
+    for p in "$PATCH_DIR"/*.patch; do
+        [ -e "$p" ] || continue
+        if git -C "$DST" apply --check "$p" 2>/dev/null; then
+            git -C "$DST" apply "$p"
+            echo "  ✓ 已打补丁 $(basename "$p")"
+        elif git -C "$DST" apply --reverse --check "$p" 2>/dev/null; then
+            echo "  · 已是打过的状态，跳过 $(basename "$p")"
+        else
+            echo "  ✗ 补丁打不上: $(basename "$p")"
+            echo "    多半是换了上游版本导致上下文对不上，需要手工适配后重新生成。"
+            exit 1
+        fi
+    done
+}
+
 if [ -d "$DST/vins" ]; then
     echo "✓ 源码已存在: $DST"
+    echo "▸ 检查补丁..."
+    apply_patches
     echo "  要重新获取请先删除: rm -rf $DST"
     exit 0
 fi
@@ -37,6 +62,9 @@ else
     git clone "$REPO" "$DST"
     (cd "$DST" && git checkout -q "$PINNED")
 fi
+
+echo "▸ 应用本项目补丁..."
+apply_patches
 
 echo "✓ 完成: $DST"
 echo

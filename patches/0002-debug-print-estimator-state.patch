@@ -1,0 +1,29 @@
+diff --git a/vins/src/utility/visualization.cpp b/vins/src/utility/visualization.cpp
+index 8146f19..25b26ea 100755
+--- a/vins/src/utility/visualization.cpp
++++ b/vins/src/utility/visualization.cpp
+@@ -184,6 +184,24 @@ void pubOdometry(const Estimator &estimator, const std_msgs::msg::Header &header
+         printf("time: %f, t: %f %f %f q: %f %f %f %f \n", header.stamp.sec + header.stamp.nanosec * (1e-9),
+                                                           tmp_T.x(), tmp_T.y(), tmp_T.z(),
+                                                           tmp_Q.w(), tmp_Q.x(), tmp_Q.y(), tmp_Q.z());
++        // 本地调试输出：静止时若位置发散，看这三行就能定位是零偏没收敛还是视觉没约束住。
++        //   Ba 应收敛到 (实测重力模长 - g_norm) 量级；Bg 应收敛到静止时的陀螺读数；
++        //   V 应保持 ~0；用于优化的特征数(带深度的)若过少说明视觉根本没在约束。
++        // getFeatureCount() 非 const，这里就地数。判据必须与 optimization()
++        // 里的完全一致(estimator.cpp:1150 只看 used_num >= 4)，否则量的不是
++        // 真正参与优化的那批点。
++        int n_feat = 0, n_all = 0, n_stereo = 0;
++        for (auto &it : estimator.f_manager.feature)
++        {
++            n_all++;
++            if (it.feature_per_frame.size() >= 4) n_feat++;
++            for (auto &f : it.feature_per_frame) if (f.is_stereo) { n_stereo++; break; }
++        }
++        printf("  DBG V: %8.4f %8.4f %8.4f | Ba: %8.5f %8.5f %8.5f | Bg: %8.5f %8.5f %8.5f | feat: %d/%d 双目 %d\n",
++               estimator.Vs[WINDOW_SIZE].x(), estimator.Vs[WINDOW_SIZE].y(), estimator.Vs[WINDOW_SIZE].z(),
++               estimator.Bas[WINDOW_SIZE].x(), estimator.Bas[WINDOW_SIZE].y(), estimator.Bas[WINDOW_SIZE].z(),
++               estimator.Bgs[WINDOW_SIZE].x(), estimator.Bgs[WINDOW_SIZE].y(), estimator.Bgs[WINDOW_SIZE].z(),
++               n_feat, n_all, n_stereo);
+     }
+ }
+ 
