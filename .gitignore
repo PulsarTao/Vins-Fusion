@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------------
+# 第三方 VINS-Fusion ROS2 源码
+# 不纳入版本控制：它是上游 GPL-3.0 项目，有明确的仓库和版本号，
+# 且含一个 58MB 的词袋二进制文件(brief_k10L6.bin)。
+# 用 ./scripts/fetch_upstream.sh 自动获取指定版本，详见 docs/UPSTREAM.md
+# ---------------------------------------------------------------------------
+src_upstream/
+
+# 构建中间产物（由 scripts/build_*.sh 自动生成）
+build_ctx/
+dist/
+
+# 运行时输出
+*.log
+output/
+logs/
+
+# 系统垃圾文件
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.bak
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.iml
