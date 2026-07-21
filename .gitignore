@@ -10,6 +10,10 @@ src_upstream/
 build_ctx/
 dist/
 
+# seeker 驱动的 colcon 工作区（由 run.sh local seeker 自动创建）
+# src/seeker1 是指向 ros2_ws_src/seeker1 的软链，源码本体已在版本控制里
+.seeker_ws/
+
 # 运行时输出
 *.log
 output/
