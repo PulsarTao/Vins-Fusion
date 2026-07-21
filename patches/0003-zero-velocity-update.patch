@@ -1,0 +1,201 @@
+diff --git a/vins/src/estimator/estimator.cpp b/vins/src/estimator/estimator.cpp
+index 63a48d5..51354c0 100755
+--- a/vins/src/estimator/estimator.cpp
++++ b/vins/src/estimator/estimator.cpp
+@@ -43,6 +43,8 @@ void Estimator::clearState()
+     initR = Eigen::Matrix3d::Identity();
+     inputImageCnt = 0;
+     initFirstPoseFlag = false;
++    is_static = false;
++    static_count = 0;
+ 
+     for (int i = 0; i < WINDOW_SIZE + 1; i++)
+     {
+@@ -233,6 +235,74 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
+ }
+ 
+ 
++// ---------------------------------------------------------------------------
++// 零速修正(ZUPT)的静止检测 —— 本项目新增
++//
++// 判据用【标准差】而不是原始读数:
++//   * 陀螺静止时读数不为零(它就是零偏，本机实测 0.028 rad/s)，
++//     直接对模长设阈值会把静止误判成运动
++//   * 加速度计静止时读数是重力(约 9.9)，同理不能对模长设阈值
++// 所以看的是「读数波动有多小」。本机实测静止时的标准差:
++//     accel 0.006 m/s²   gyro 0.0006 rad/s
++// 阈值取实测值的约 10 倍，留足余量。
++//
++// 另加一条重力模长校验: 匀加速运动时标准差同样很小，但比力模长会偏离 g，
++// 单看标准差会漏判。
++//
++// 迟滞: 连续 5 个图像区间(约 0.5s)判定为静止才进入静止态，
++// 一旦有一个区间判定为运动就立刻退出 —— 宁可少修正，不可误修正。
++bool Estimator::detectStatic(const vector<pair<double, Eigen::Vector3d>> &accVector,
++                             const vector<pair<double, Eigen::Vector3d>> &gyrVector)
++{
++    const double ACC_STD_TH = 0.06;      // m/s²
++    const double GYR_STD_TH = 0.008;     // rad/s
++    const double G_DEV_TH   = 0.5;       // m/s²，比力模长偏离重力的容许量
++    const int    HOLD_N     = 5;         // 迟滞: 需连续多少个区间
++
++    bool moving = true;
++    if (accVector.size() >= 5 && gyrVector.size() == accVector.size())
++    {
++        Eigen::Vector3d am = Eigen::Vector3d::Zero(), gm = Eigen::Vector3d::Zero();
++        for (size_t i = 0; i < accVector.size(); i++)
++        {
++            am += accVector[i].second;
++            gm += gyrVector[i].second;
++        }
++        am /= accVector.size();
++        gm /= gyrVector.size();
++
++        Eigen::Vector3d av = Eigen::Vector3d::Zero(), gv = Eigen::Vector3d::Zero();
++        for (size_t i = 0; i < accVector.size(); i++)
++        {
++            av += (accVector[i].second - am).cwiseAbs2();
++            gv += (gyrVector[i].second - gm).cwiseAbs2();
++        }
++        const double a_std = std::sqrt((av / accVector.size()).maxCoeff());
++        const double g_std = std::sqrt((gv / gyrVector.size()).maxCoeff());
++
++        moving = (a_std > ACC_STD_TH) || (g_std > GYR_STD_TH) ||
++                 (std::fabs(am.norm() - G.norm()) > G_DEV_TH);
++    }
++
++    if (moving)
++    {
++        static_count = 0;
++        if (is_static)
++            ROS_INFO("ZUPT: 检测到运动，退出零速修正");
++        is_static = false;
++    }
++    else
++    {
++        static_count++;
++        if (!is_static && static_count >= HOLD_N)
++        {
++            is_static = true;
++            ROS_INFO("ZUPT: 检测到静止，启用零速修正");
++        }
++    }
++    return is_static;
++}
++
+ bool Estimator::getIMUInterval(double t0, double t1, vector<pair<double, Eigen::Vector3d>> &accVector, 
+                                 vector<pair<double, Eigen::Vector3d>> &gyrVector)
+ {
+@@ -314,6 +384,7 @@ void Estimator::processMeasurements()
+             {
+                 // cout << "2-1)" << endl;
+                 getIMUInterval(prevTime, curTime, accVector, gyrVector);
++                detectStatic(accVector, gyrVector);   // ZUPT: 更新静止判定
+                 // cout << "2-2)" << endl;
+             }
+ 
+@@ -1150,6 +1221,15 @@ void Estimator::optimization()
+             IMUFactor* imu_factor = new IMUFactor(pre_integrations[j]);
+             problem.AddResidualBlock(imu_factor, NULL, para_Pose[i], para_SpeedBias[i], para_Pose[j], para_SpeedBias[j]);
+         }
++
++        // 零速修正: 静止时把窗口内每一帧的速度钉到零。
++        // 速度被钉住后 IMU 的速度残差就唯一确定了加速度计零偏，
++        // 零偏不再随机游走 —— 这才是静止长跑不发散的关键。
++        if (is_static)
++        {
++            for (int i = 0; i <= WINDOW_SIZE; i++)
++                problem.AddResidualBlock(new ZeroVelocityFactor(), NULL, para_SpeedBias[i]);
++        }
+     }
+ 
+     int f_m_cnt = 0;
+diff --git a/vins/src/estimator/estimator.h b/vins/src/estimator/estimator.h
+index bf27b8c..56dbeab 100755
+--- a/vins/src/estimator/estimator.h
++++ b/vins/src/estimator/estimator.h
+@@ -34,6 +34,7 @@
+ #include "../factor/projectionTwoFrameOneCamFactor.h"
+ #include "../factor/projectionTwoFrameTwoCamFactor.h"
+ #include "../factor/projectionOneFrameTwoCamFactor.h"
++#include "../factor/zero_velocity_factor.h"
+ #include "../featureTracker/feature_tracker.h"
+ 
+ #define ROS_INFO RCUTILS_LOG_INFO
+@@ -177,5 +178,13 @@ class Estimator
+     Eigen::Quaterniond latest_Q;
+ 
+     bool initFirstPoseFlag;
++
++    // ---- 零速修正(ZUPT)，本项目新增 ----
++    // 静止时加速度计零偏不可观会一路游走，最终把位置带飞。
++    // 详见 factor/zero_velocity_factor.h 的说明与实测数据。
++    bool detectStatic(const std::vector<std::pair<double, Eigen::Vector3d>> &accVector,
++                      const std::vector<std::pair<double, Eigen::Vector3d>> &gyrVector);
++    bool is_static;          // 当前是否判定为静止
++    int  static_count;       // 连续判定为静止的区间数(用于迟滞)
+     bool initThreadFlag;
+ };
+diff --git a/vins/src/factor/zero_velocity_factor.h b/vins/src/factor/zero_velocity_factor.h
+new file mode 100644
+index 0000000..c049c2b
+--- /dev/null
++++ b/vins/src/factor/zero_velocity_factor.h
+@@ -0,0 +1,57 @@
++/*******************************************************
++ * 零速修正(ZUPT) —— 本项目新增，非上游文件
++ *
++ * 为什么需要它:
++ *   加速度计零偏与重力方向在【无运动】时高度耦合、几乎不可观 ——
++ *   要靠姿态变化才能把两者解耦。VINS-Fusion 没有零速修正，
++ *   相机长时间静止时零偏就一路随机游走。本机实测(seeker1 四目鱼眼，
++ *   相机静置桌面 47 分钟)，Ba_y 的演化:
++ *       0.002 -> 0.18 -> 0.49 -> 0.60 -> 0.72 m/s²
++ *   而静止实测加速度是 (0.234, 0.098, 9.884)，真实零偏应该很小，
++ *   0.68 m/s² 在物理上不合理。零偏走到病态区域后优化退化、状态冻结，
++ *   位置随即按 0.5*Ba*t² 二次爆炸(实测漂到 6876 米)。
++ *
++ * 做法:
++ *   检测到静止时，给窗口内每一帧的速度加一个「速度应为零」的残差。
++ *   速度被钉住后，IMU 预积分的速度残差
++ *       r_v = delta_v(Ba,Bg) - R_i^T * g * dt
++ *   就直接决定了 Ba —— 零偏从「不可观、随便游走」变成「有唯一解」，
++ *   连带把零偏也稳住了，不需要另外再加零偏保持项。
++ *
++ * 对运动工况无影响: 静止检测不通过时这个因子根本不会被加进 problem。
++ *******************************************************/
++
++#pragma once
++
++#include <ceres/ceres.h>
++#include <eigen3/Eigen/Dense>
++
++#include "../estimator/parameters.h"
++
++// 参数块是 para_SpeedBias[i]，布局为 [V(0..2), Ba(3..5), Bg(6..8)]，
++// 这里只对前三维(速度)施加约束。
++class ZeroVelocityFactor : public ceres::SizedCostFunction<3, 9>
++{
++  public:
++    // sigma 取 1mm/s: 比 IMU 因子的速度不确定度(acc_n=0.1 时约 32mm/s)强一个量级，
++    // 足以钉住速度；又不是硬约束，姿态/零偏仍有调整余地，退出静止时能平滑过渡。
++    static constexpr double SIGMA = 0.001;
++
++    virtual bool Evaluate(double const *const *parameters, double *residuals,
++                          double **jacobians) const
++    {
++        const double w = 1.0 / SIGMA;
++
++        residuals[0] = w * parameters[0][0];
++        residuals[1] = w * parameters[0][1];
++        residuals[2] = w * parameters[0][2];
++
++        if (jacobians && jacobians[0])
++        {
++            Eigen::Map<Eigen::Matrix<double, 3, 9, Eigen::RowMajor>> J(jacobians[0]);
++            J.setZero();
++            J.block<3, 3>(0, 0) = w * Eigen::Matrix3d::Identity();
++        }
++        return true;
++    }
++};
