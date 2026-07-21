@@ -1,0 +1,23 @@
+%YAML:1.0
+---
+# 由 gen_seeker_config.py 生成，请勿手改
+#
+# 这是【虚拟】针孔相机 —— 物理上是鱼眼，由 seeker_split_node 用预计算的
+# remap 表去畸变成针孔后才发出来。所以这里畸变系数全 0 是对的，不是漏填。
+#
+# 为什么不用鱼眼原生的 MEI 模型：出厂标定 xi=3.22 > 1，VINS 的
+# CataCamera 反投影会开负数根得到 NaN。详见 gen_seeker_config.py 头部说明。
+model_type: PINHOLE
+camera_name: cam1
+image_width: 640
+image_height: 480
+distortion_parameters:
+   k1: 0.0
+   k2: 0.0
+   p1: 0.0
+   p2: 0.0
+projection_parameters:
+   fx: 320.0000000000
+   fy: 320.0000000000
+   cx: 320.0000000000
+   cy: 240.0000000000
