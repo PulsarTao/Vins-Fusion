@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ============================================================================
+     OakD-VINS — 基于 PX4 自带 OakD-Lite 改造，专供 VINS-Fusion 使用
+
+     相比原版的改动（都是为了性能和 VIO 适用性）：
+       1) 相机 1920x1080 → 640x480
+          原版在本机只能跑到 9 Hz，且把系统负载拖到很高；
+          VIO 根本不需要那么高分辨率（EuRoC/TUM 等主流数据集都是 640x480 级别）。
+       2) 删掉 StereoOV7251 深度相机
+          VINS-Fusion 用不到深度图，但它每帧都要渲染，是很大的浪费。
+       3) update_rate 保持 30 Hz —— 降分辨率后才能真正跑满。
+
+     mesh 仍复用 PX4 自带的 OakD-Lite 资源（GZ_SIM_RESOURCE_PATH 里能找到），
+     不复制文件，也不修改 PX4 仓库。
+     ============================================================================ -->
+<sdf version='1.9'>
+  <model name='OakD-VINS'>
+    <pose>0 0 0 0 0 0</pose>
+    <self_collide>false</self_collide>
+    <static>false</static>
+    <link name="camera_link">
+      <inertial>
+        <pose>0.00358 -0.03 .014 0 0 0</pose>
+        <mass>0.061</mass>
+        <inertia>
+          <ixx>0.0000460804</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.0000055421</iyy>
+          <iyz>0</iyz>
+          <izz>0.0000436519</izz>
+        </inertia>
+      </inertial>
+      <visual name="OakD-VINS/visual">
+        <pose>0 0 0 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <scale>1 1 1</scale>
+            <uri>model://OakD-Lite/meshes/OakDLite.dae</uri>
+          </mesh>
+        </geometry>
+      </visual>
+      <collision name="OakD-VINS/collision">
+        <pose>0.00358 -0.03 .014 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.0175 0.091 0.028</size>
+          </box>
+        </geometry>
+      </collision>
+
+      <!-- VIO 主相机：640x480 @ 30Hz。
+           pose 与原版保持一致，这样外参推导沿用同一套数值。 -->
+      <sensor name="IMX214" type="camera">
+        <pose>0.01233 -0.03 .01878 0 0 0</pose>
+        <camera>
+          <horizontal_fov>1.204</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.1</near>
+            <far>100</far>
+          </clip>
+          <!-- 加一点噪声，避免仿真图像过于"干净"导致特征跟踪表现失真 -->
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.005</stddev>
+          </noise>
+        </camera>
+        <always_on>1</always_on>
+        <update_rate>30</update_rate>
+        <visualize>true</visualize>
+      </sensor>
+
+      <gravity>true</gravity>
+      <velocity_decay/>
+    </link>
+  </model>
+</sdf>
