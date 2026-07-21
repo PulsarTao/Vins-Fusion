@@ -1,0 +1,17 @@
+%YAML:1.0
+---
+# 从本机 D435i 出厂标定读出（红外流已硬件校正，畸变为零）
+model_type: PINHOLE
+camera_name: cam1
+image_width: 848
+image_height: 480
+distortion_parameters:
+   k1: 0.0
+   k2: 0.0
+   p1: 0.0
+   p2: 0.0
+projection_parameters:
+   fx: 427.4832458496094
+   fy: 427.4832458496094
+   cx: 425.93841552734375
+   cy: 239.39411926269531

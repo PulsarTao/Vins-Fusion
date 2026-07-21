@@ -1,0 +1,18 @@
+%YAML:1.0
+---
+# 从 Gazebo /cam0/camera_info 实测（OakD-VINS IMX214, 640x480, HFOV 1.204 rad）
+# 仿真相机为理想针孔模型，无畸变
+model_type: PINHOLE
+camera_name: cam0
+image_width: 640
+image_height: 480
+distortion_parameters:
+   k1: 0.0
+   k2: 0.0
+   p1: 0.0
+   p2: 0.0
+projection_parameters:
+   fx: 465.7411193847656
+   fy: 465.7411766052246
+   cx: 320.0
+   cy: 240.0

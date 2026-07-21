@@ -1,0 +1,90 @@
+%YAML:1.0
+
+# =============================================================================
+#  PX4 + Gazebo Harmonic 仿真 · 单目 + IMU · VINS-Fusion (ROS2 Humble)
+#
+#  机型: x500_depth_vinsfusion (本项目自定义, 见 models/)
+#        相机 OakD-VINS 640x480@30Hz —— 由 OakD-Lite 改造:
+#        1920x1080→640x480 且删掉深度相机，帧率 9Hz→20Hz、系统负载大幅下降
+#  注意: 该机型只有【单目 RGB + 深度】，没有双目左右目图像对，
+#        所以这里用单目+IMU 模式 (num_of_cam: 1)。
+# =============================================================================
+
+#common parameters
+imu: 1
+num_of_cam: 1
+
+imu_topic: "/imu0"
+image0_topic: "/cam0/image_raw"
+output_path: "/root/output/"
+
+cam0_calib: "cam0_pinhole.yaml"
+image_width: 640
+image_height: 480
+
+# GPU 加速（此移植版支持，宿主 amd64 镜像未开）
+use_gpu         : 0
+use_gpu_acc_flow: 0
+use_gpu_ceres   : 0
+
+# -----------------------------------------------------------------------------
+# 外参：IMU(base_link) ← 相机(IMX214)
+#
+# 平移由模型层级精确推导：
+#   x500_depth/model.sdf : camera_link 相对 base_link = (0.12,  0.03, 0.242)
+#   OakD-Lite/model.sdf  : IMX214 相对 camera_link    = (0.01233, -0.03, 0.01878)
+#   => 相机相对 IMU = (0.13233, 0.0, 0.26078)
+#
+# 旋转：Gazebo 相机光轴朝机体 +x（前），VINS 用光学系（z 前、x 右、y 下），
+#   R_body_cam = [[0,0,1],[-1,0,0],[0,-1,0]]
+#
+# 注：本机型的 camera_imu（camera_link 上那个 250Hz IMU）实测【没有发布者】，
+#     所以用飞控在用的 base_link/imu_sensor，外参即上面推导的值。
+# -----------------------------------------------------------------------------
+estimate_extrinsic: 0       # 仿真中外参由模型精确推导，完全信任比在线估计更稳
+
+body_T_cam0: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ 0.0,  0.0,  1.0,  0.13233,
+          -1.0,  0.0,  0.0,  0.0,
+           0.0, -1.0,  0.0,  0.26078,
+           0.0,  0.0,  0.0,  1.0 ]
+
+#Multiple thread support
+multiple_thread: 1
+
+# -----------------------------------------------------------------------------
+# 前端：640x480 @ ~20Hz。森林场景纹理丰富(树干/草地)，特征充足。
+# 若 CPU 跟不上（/odometry 频率明显低于图像帧率），先调小 max_cnt。
+# -----------------------------------------------------------------------------
+max_cnt: 150
+min_dist: 25
+freq: 10
+F_threshold: 1.0
+show_track: 1
+flow_back: 1
+
+#optimization parameters
+max_solver_time: 0.04   # 相机 ~20Hz → 单帧预算 50ms，留有余量
+max_num_iterations: 8
+keyframe_parallax: 10.0
+
+# -----------------------------------------------------------------------------
+# IMU 噪声（Gazebo imu_sensor 的仿真噪声，宁大勿小）
+# -----------------------------------------------------------------------------
+acc_n: 0.1
+gyr_n: 0.01
+acc_w: 0.001
+gyr_w: 0.0001
+g_norm: 9.8066     # 与 Gazebo world 的重力一致
+
+# 仿真中相机与 IMU 共用同一仿真钟，无需在线估计时间偏移
+estimate_td: 0
+td: 0.0
+
+#loop closure parameters
+load_previous_pose_graph: 0
+pose_graph_save_path: "/root/output/pose_graph/"
+save_image: 0
