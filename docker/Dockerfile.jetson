@@ -1,0 +1,86 @@
+# =============================================================================
+#  VINS-Fusion (ROS2 Humble) · Jetson AGX Orin CUDA 加速变体
+#
+#  基础镜像: dustynv/ros:humble-ros-base-l4t-r36.2.0
+#    - 基于 NVIDIA L4T (JetPack 6.x / Ubuntu 22.04)，已预装 ROS2 Humble
+#    - CUDA / cuDNN / OpenCV(带 CUDA) 由 JetPack 通过 nvidia 容器运行时注入
+#
+#  ⚠ 版本必须与板子的 JetPack 对应:
+#      JetPack 6.0 (L4T R36.2)  → r36.2.0   (本文件默认)
+#      JetPack 5.1 (L4T R35.3)  → r35.3.1   (改下面的 FROM)
+#    查看板子版本: cat /etc/nv_tegra_release
+#
+#  ⚠ 运行时必须加 --runtime nvidia，否则 CUDA 库不会注入（deploy.sh 已自动处理）
+# =============================================================================
+FROM dustynv/ros:humble-ros-base-l4t-r36.2.0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    ROS_DISTRO=humble \
+    CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:$PATH \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+
+# ---------------------------------------------------------------- 编译依赖
+# 注意：不要装 libopencv-dev！L4T 镜像自带带 CUDA 的 OpenCV，
+# apt 版会覆盖它并丢掉 CUDA 支持（这是 Jetson 上最常见的踩坑点）。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git \
+        libeigen3-dev \
+        libceres-dev \
+        libgoogle-glog-dev libgflags-dev \
+        libatlas-base-dev libsuitesparse-dev \
+        python3-colcon-common-extensions \
+        ros-humble-cv-bridge \
+        ros-humble-image-transport \
+        ros-humble-tf2 ros-humble-tf2-ros ros-humble-tf2-geometry-msgs \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------- RealSense
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ros-humble-librealsense2 \
+        ros-humble-realsense2-camera \
+        ros-humble-realsense2-camera-msgs \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------- mavros
+COPY egm96-5.tar.bz2 /tmp/egm96-5.tar.bz2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ros-humble-mavros ros-humble-mavros-extras ros-humble-mavros-msgs \
+        geographiclib-tools \
+    && mkdir -p /usr/share/GeographicLib \
+    && tar xjf /tmp/egm96-5.tar.bz2 -C /usr/share/GeographicLib \
+    && rm /tmp/egm96-5.tar.bz2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------- VINS-Fusion
+ENV ROS2_WS=/ros2_ws
+WORKDIR $ROS2_WS
+COPY src/ $ROS2_WS/src/
+
+RUN . /opt/ros/humble/setup.sh && \
+    colcon build \
+        --symlink-install \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release \
+        --parallel-workers $(nproc) && \
+    rm -rf build log
+
+COPY config/ $ROS2_WS/vins_config/
+COPY launch/ $ROS2_WS/vins_launch/
+COPY scripts/ $ROS2_WS/scripts/
+RUN chmod +x $ROS2_WS/scripts/*.py 2>/dev/null || true
+
+# Jetson 变体默认打开 GPU 加速（光流 + 特征提取走 CUDA）
+RUN sed -i 's/^use_gpu *: *0/use_gpu         : 1/; s/^use_gpu_acc_flow *: *0/use_gpu_acc_flow: 1/' \
+        $ROS2_WS/vins_config/d435i/d435i_stereo_imu.yaml || true
+
+RUN echo 'source /opt/ros/humble/setup.bash' >> /root/.bashrc && \
+    echo 'source /ros2_ws/install/setup.bash' >> /root/.bashrc && \
+    mkdir -p /root/output
+
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+RUN printf '#!/bin/bash\nset -e\nsource /opt/ros/humble/setup.bash\nsource /ros2_ws/install/setup.bash\nexec "$@"\n' \
+      > /ros_entrypoint.sh && chmod +x /ros_entrypoint.sh
+ENTRYPOINT ["/ros_entrypoint.sh"]
+CMD ["bash"]
