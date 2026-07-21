@@ -43,6 +43,14 @@ else
     docker build --file "$BUILD_CTX/Dockerfile" --tag "$IMAGE" "$BUILD_CTX"
 fi
 
+
+# ---- 清理构建产生的悬空镜像(<none>) ----
+# 每次重建都会把旧镜像变成 <none>，不清会越积越多占满磁盘
+DANGLING=$(docker images -f "dangling=true" -q 2>/dev/null | wc -l)
+if [ "${DANGLING:-0}" -gt 0 ]; then
+    echo "▸ 清理 $DANGLING 个悬空镜像(<none>)..."
+    docker image prune -f >/dev/null 2>&1 || true
+fi
 echo "✓ 构建完成"
 docker image inspect "$IMAGE" --format '  大小: {{.Size}} bytes  架构: {{.Architecture}}'
 echo
