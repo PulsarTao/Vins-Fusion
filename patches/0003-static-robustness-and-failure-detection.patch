@@ -1,0 +1,330 @@
+diff --git a/vins/src/estimator/estimator.cpp b/vins/src/estimator/estimator.cpp
+index 63a48d5..a1dc4ad 100755
+--- a/vins/src/estimator/estimator.cpp
++++ b/vins/src/estimator/estimator.cpp
+@@ -43,6 +43,8 @@ void Estimator::clearState()
+     initR = Eigen::Matrix3d::Identity();
+     inputImageCnt = 0;
+     initFirstPoseFlag = false;
++    is_static = false;
++    static_count = 0;
+ 
+     for (int i = 0; i < WINDOW_SIZE + 1; i++)
+     {
+@@ -233,6 +235,74 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
+ }
+ 
+ 
++// ---------------------------------------------------------------------------
++// 零速修正(ZUPT)的静止检测 —— 本项目新增
++//
++// 判据用【标准差】而不是原始读数:
++//   * 陀螺静止时读数不为零(它就是零偏，本机实测 0.028 rad/s)，
++//     直接对模长设阈值会把静止误判成运动
++//   * 加速度计静止时读数是重力(约 9.9)，同理不能对模长设阈值
++// 所以看的是「读数波动有多小」。本机实测静止时的标准差:
++//     accel 0.006 m/s²   gyro 0.0006 rad/s
++// 阈值取实测值的约 10 倍，留足余量。
++//
++// 另加一条重力模长校验: 匀加速运动时标准差同样很小，但比力模长会偏离 g，
++// 单看标准差会漏判。
++//
++// 迟滞: 连续 5 个图像区间(约 0.5s)判定为静止才进入静止态，
++// 一旦有一个区间判定为运动就立刻退出 —— 宁可少修正，不可误修正。
++bool Estimator::detectStatic(const vector<pair<double, Eigen::Vector3d>> &accVector,
++                             const vector<pair<double, Eigen::Vector3d>> &gyrVector)
++{
++    const double ACC_STD_TH = 0.06;      // m/s²
++    const double GYR_STD_TH = 0.008;     // rad/s
++    const double G_DEV_TH   = 0.5;       // m/s²，比力模长偏离重力的容许量
++    const int    HOLD_N     = 5;         // 迟滞: 需连续多少个区间
++
++    bool moving = true;
++    if (accVector.size() >= 5 && gyrVector.size() == accVector.size())
++    {
++        Eigen::Vector3d am = Eigen::Vector3d::Zero(), gm = Eigen::Vector3d::Zero();
++        for (size_t i = 0; i < accVector.size(); i++)
++        {
++            am += accVector[i].second;
++            gm += gyrVector[i].second;
++        }
++        am /= accVector.size();
++        gm /= gyrVector.size();
++
++        Eigen::Vector3d av = Eigen::Vector3d::Zero(), gv = Eigen::Vector3d::Zero();
++        for (size_t i = 0; i < accVector.size(); i++)
++        {
++            av += (accVector[i].second - am).cwiseAbs2();
++            gv += (gyrVector[i].second - gm).cwiseAbs2();
++        }
++        const double a_std = std::sqrt((av / accVector.size()).maxCoeff());
++        const double g_std = std::sqrt((gv / gyrVector.size()).maxCoeff());
++
++        moving = (a_std > ACC_STD_TH) || (g_std > GYR_STD_TH) ||
++                 (std::fabs(am.norm() - G.norm()) > G_DEV_TH);
++    }
++
++    if (moving)
++    {
++        static_count = 0;
++        if (is_static)
++            ROS_INFO("ZUPT: 检测到运动，退出零速修正");
++        is_static = false;
++    }
++    else
++    {
++        static_count++;
++        if (!is_static && static_count >= HOLD_N)
++        {
++            is_static = true;
++            ROS_INFO("ZUPT: 检测到静止，启用零速修正");
++        }
++    }
++    return is_static;
++}
++
+ bool Estimator::getIMUInterval(double t0, double t1, vector<pair<double, Eigen::Vector3d>> &accVector, 
+                                 vector<pair<double, Eigen::Vector3d>> &gyrVector)
+ {
+@@ -314,6 +384,7 @@ void Estimator::processMeasurements()
+             {
+                 // cout << "2-1)" << endl;
+                 getIMUInterval(prevTime, curTime, accVector, gyrVector);
++                detectStatic(accVector, gyrVector);   // ZUPT: 更新静止判定
+                 // cout << "2-2)" << endl;
+             }
+ 
+@@ -1045,20 +1116,53 @@ void Estimator::double2vector()
+ 
+ bool Estimator::failureDetection()
+ {
+-    return false;
+-    if (f_manager.last_track_num < 2)
++    // -------------------------------------------------------------------------
++    // 本地补丁：启用失效检测
++    //
++    // 上游这个函数第一行就是 return false，整个函数体是死代码，而且里面的判据
++    // 大多还被注释成 //return true。也就是说 VINS-Fusion 出厂状态【永远检测不到
++    // 失效】—— 视觉跟踪一旦垮掉(黑暗、遮挡、剧烈运动)，它不会重置，
++    // 而是带着已经发散的状态一路积分下去。
++    //
++    // 本机实测: 房间灯关掉后画面均值从 137 掉到 27.8，特征数从 120/150 崩到
++    // 21/95，VINS 没有任何提示，位置在几分钟内从 6cm 漂到 40m，最终到公里量级。
++    // 对下游(飞控/建图)来说，一个静默发散的位姿比一个明确报错的失效危险得多。
++    //
++    // 这里恢复检测。触发后上层会 clearState() + 重新初始化 —— 会丢掉地图，
++    // 但远好过输出一个几公里外的假位姿。阈值都取得很宽松，只抓真正的失效。
++    // -------------------------------------------------------------------------
++    if (f_manager.last_track_num < 8)
+     {
+-        ROS_INFO(" little feature %d", f_manager.last_track_num);
+-        //return true;
++        ROS_WARN("失效检测: 跟踪特征过少(%d) —— 场景可能过暗/无纹理/被遮挡",
++                 f_manager.last_track_num);
++        return true;
++    }
++    if (Vs[WINDOW_SIZE].norm() > 20.0)
++    {
++        // 手持或小型无人机不可能到 20m/s。到这个量级说明已经在发散，
++        // 早点重置比让它继续积分好。
++        ROS_WARN("失效检测: 速度估计异常(%.1f m/s)", Vs[WINDOW_SIZE].norm());
++        return true;
+     }
+     if (Bas[WINDOW_SIZE].norm() > 2.5)
+     {
+-        ROS_INFO(" big IMU acc bias estimation %f", Bas[WINDOW_SIZE].norm());
++        ROS_WARN("失效检测: 加速度计零偏过大(%.3f)", Bas[WINDOW_SIZE].norm());
+         return true;
+     }
+     if (Bgs[WINDOW_SIZE].norm() > 1.0)
+     {
+-        ROS_INFO(" big IMU gyr bias estimation %f", Bgs[WINDOW_SIZE].norm());
++        ROS_WARN("失效检测: 陀螺零偏过大(%.3f)", Bgs[WINDOW_SIZE].norm());
++        return true;
++    }
++    // 单帧位置跳变。静止长跑时实测到过一次「0.893m -> 325.486m」的单帧突变
++    // (相邻两帧间隔 0.1s，等于 3255 m/s)，是优化器一次灾难性迭代步的结果，
++    // 不是渐进漂移。这类退化无法彻底避免(静止本就是 VIO 的退化构型)，
++    // 但绝不能静默输出 —— 下游飞控拿到这种位姿会直接失控。
++    // 阈值 0.5m/帧 对手持或小型无人机已经很宽松(相当于 5 m/s)。
++    if ((Ps[WINDOW_SIZE] - last_P).norm() > 0.5)
++    {
++        ROS_WARN("失效检测: 单帧位置跳变 %.2f m —— 优化器发散",
++                 (Ps[WINDOW_SIZE] - last_P).norm());
+         return true;
+     }
+     /*
+@@ -1097,6 +1201,15 @@ void Estimator::optimization()
+     TicToc t_whole, t_prepare;
+     vector2double();
+ 
++    // 静止时先把速度清零再冻结 —— 否则冻住的可能是一个已经发散的值。
++    // 清零后 IMU 预积分的速度残差 r_v = delta_v(Ba,Bg) - R_i^T*g*dt
++    // 就唯一确定了加速度计零偏，零偏不再随机游走。
++    if (USE_IMU && is_static)
++    {
++        for (int i = 0; i <= WINDOW_SIZE; i++)
++            para_SpeedBias[i][0] = para_SpeedBias[i][1] = para_SpeedBias[i][2] = 0.0;
++    }
++
+     ceres::Problem problem;
+     ceres::LossFunction *loss_function;
+     //loss_function = NULL;
+@@ -1108,7 +1221,26 @@ void Estimator::optimization()
+         ceres::Manifold *local_parameterization = new PoseLocalParameterization();
+         problem.AddParameterBlock(para_Pose[i], SIZE_POSE, local_parameterization);
+         if(USE_IMU)
+-            problem.AddParameterBlock(para_SpeedBias[i], SIZE_SPEEDBIAS);
++        {
++            // 零速修正(ZUPT): 静止时把速度(参数块前 3 维)【硬性冻结】。
++            //
++            // 早前用的是「加一个零速残差」的软约束(权重 1/0.001)，实测只能撑约
++            // 3 分钟: 前 1800 帧速度稳在 0.0002 m/s，之后一路失控到 20 m/s，
++            // 而 ZUPT 判定标志全程为真。原因是软约束要和边缘化先验竞争 ——
++            // 先验会随时间累积信息、变得极其刚硬，最终盖过零速项；
++            // 而且零速项没有进入边缘化，先验里根本不含「速度为零」这个信息。
++            // 改成 SubsetManifold 硬冻结后，优化器根本无法改动速度维度，
++            // 不存在谁压过谁的问题。
++            if (is_static)
++            {
++                static const std::vector<int> kFixedVel{0, 1, 2};
++                problem.AddParameterBlock(para_SpeedBias[i], SIZE_SPEEDBIAS,
++                                          new ceres::SubsetManifold(SIZE_SPEEDBIAS, kFixedVel));
++            }
++            else
++                problem.AddParameterBlock(para_SpeedBias[i], SIZE_SPEEDBIAS);
++        }
++
+     }
+     if(!USE_IMU)
+         problem.SetParameterBlockConstant(para_Pose[0]);
+@@ -1149,6 +1281,13 @@ void Estimator::optimization()
+                 continue;
+             IMUFactor* imu_factor = new IMUFactor(pre_integrations[j]);
+             problem.AddResidualBlock(imu_factor, NULL, para_Pose[i], para_SpeedBias[i], para_Pose[j], para_SpeedBias[j]);
++
++            // 零运动约束: 静止时窗口内相邻帧不应产生位移。
++            // 这是【相对】约束，不与边缘化先验争夺绝对位置；配合被冻结的速度，
++            // 让优化器有依据把 processIMU 死递推出来的位置误差拉回去。
++            if (is_static)
++                problem.AddResidualBlock(new ZeroMotionFactor(), NULL,
++                                         para_Pose[i], para_Pose[j]);
+         }
+     }
+ 
+@@ -1225,6 +1364,18 @@ void Estimator::optimization()
+     TicToc t_solver;
+     ceres::Solver::Summary summary;
+     ceres::Solve(options, &problem, &summary);
++
++    // 本地诊断: 优化器一旦不再更新状态，位置就会失控发散。实测多个版本里
++    // Ba 都会在某一刻突然「一字不差地冻住」，随后位置在 2 分钟内从 0.3m
++    // 涨到 2m。这里把 Ceres 自己的终止原因打出来，才能知道它到底是
++    // 收敛了、还是因为代价非有限/线性求解失败之类的原因直接放弃了。
++    if (summary.termination_type != ceres::CONVERGENCE)
++    {
++        ROS_WARN("Ceres 未收敛: %s | 迭代 %d | 代价 %.6e -> %.6e",
++                 summary.message.c_str(),
++                 static_cast<int>(summary.iterations.size()),
++                 summary.initial_cost, summary.final_cost);
++    }
+     //cout << summary.BriefReport() << endl;
+     ROS_DEBUG("Iterations : %d", static_cast<int>(summary.iterations.size()));
+     //printf("solver costs: %f \n", t_solver.toc());
+diff --git a/vins/src/estimator/estimator.h b/vins/src/estimator/estimator.h
+index bf27b8c..a446bd3 100755
+--- a/vins/src/estimator/estimator.h
++++ b/vins/src/estimator/estimator.h
+@@ -34,6 +34,7 @@
+ #include "../factor/projectionTwoFrameOneCamFactor.h"
+ #include "../factor/projectionTwoFrameTwoCamFactor.h"
+ #include "../factor/projectionOneFrameTwoCamFactor.h"
++#include "../factor/zero_motion_factor.h"
+ #include "../featureTracker/feature_tracker.h"
+ 
+ #define ROS_INFO RCUTILS_LOG_INFO
+@@ -177,5 +178,13 @@ class Estimator
+     Eigen::Quaterniond latest_Q;
+ 
+     bool initFirstPoseFlag;
++
++    // ---- 零速修正(ZUPT)，本项目新增 ----
++    // 静止时加速度计零偏不可观会一路游走，最终把位置带飞。
++    // 详见 factor/zero_velocity_factor.h 的说明与实测数据。
++    bool detectStatic(const std::vector<std::pair<double, Eigen::Vector3d>> &accVector,
++                      const std::vector<std::pair<double, Eigen::Vector3d>> &gyrVector);
++    bool is_static;          // 当前是否判定为静止
++    int  static_count;       // 连续判定为静止的区间数(用于迟滞)
+     bool initThreadFlag;
+ };
+diff --git a/vins/src/factor/zero_motion_factor.h b/vins/src/factor/zero_motion_factor.h
+new file mode 100644
+index 0000000..215f223
+--- /dev/null
++++ b/vins/src/factor/zero_motion_factor.h
+@@ -0,0 +1,65 @@
++/*******************************************************
++ * 零运动约束 —— 本项目新增，非上游文件
++ *
++ * 静止时约束窗口内相邻两帧的位移为零: residual = P_j - P_i
++ *
++ * 为什么不能用「冻结位姿」代替(实测走过的弯路):
++ *   processIMU() 在优化【之前】就用 IMU 死递推推进了新帧的位姿:
++ *       Ps[j] += dt * Vs[j] + 0.5 * dt * dt * un_acc;
++ *   这是给优化器的初值。如果这时把位姿 SetParameterBlockConstant，
++ *   等于把这个带着零偏误差的递推结果【锁死】，优化器再也没机会纠正它。
++ *   实测: 速度精确为 0、零偏也正常，位置照样 4 分钟漂 2.23 米。
++ *   冻结不是「锁住不动」，是「锁住错误」。
++ *
++ * 为什么也不能只靠零速约束:
++ *   IMU 位置残差里的 delta_p 由加速度计零偏决定，零偏一错，
++ *   每个窗口步长都会给位置加一个固定增量。而零偏在静止时不可观，
++ *   还会被边缘化先验锁死在错误值上(实测反复冻结在 0.68 / 0.21)。
++ *   实测只冻速度: 位置仍从 1.2cm 漂到 1.22m(8 分钟)。
++ *
++ * 这里用【相对】约束而不是绝对约束，有两个好处:
++ *   1) 不与边缘化先验争夺绝对位置，避免早前软约束被先验压过的问题
++ *   2) 优化器仍可自由调整整体位姿去满足视觉观测，只是不许窗口内部产生位移
++ *******************************************************/
++
++#pragma once
++
++#include <ceres/ceres.h>
++#include <eigen3/Eigen/Dense>
++
++// 参数块是两个 para_Pose，布局为 [P(0..2), Q(3..6)]，这里只约束平移部分。
++class ZeroMotionFactor : public ceres::SizedCostFunction<3, 7, 7>
++{
++  public:
++    // sigma 取 2mm: 远小于需要抑制的漂移量(实测每帧约 0.5mm、每分钟数百 mm)，
++    // 又不是硬约束，视觉观测仍能让整体位姿平滑调整。
++    static constexpr double SIGMA = 0.002;
++
++    virtual bool Evaluate(double const *const *parameters, double *residuals,
++                          double **jacobians) const
++    {
++        const double w = 1.0 / SIGMA;
++        for (int k = 0; k < 3; ++k)
++            residuals[k] = w * (parameters[1][k] - parameters[0][k]);
++
++        // 注意 jacobian 的列数是 7(参数块的 ambient size)，
++        // 但 PoseLocalParameterization 的切空间是 6 维，
++        // ceres 会用 manifold 的 PlusJacobian 自动做投影，这里按 ambient 写即可。
++        if (jacobians)
++        {
++            if (jacobians[0])
++            {
++                Eigen::Map<Eigen::Matrix<double, 3, 7, Eigen::RowMajor>> J(jacobians[0]);
++                J.setZero();
++                J.block<3, 3>(0, 0) = -w * Eigen::Matrix3d::Identity();
++            }
++            if (jacobians[1])
++            {
++                Eigen::Map<Eigen::Matrix<double, 3, 7, Eigen::RowMajor>> J(jacobians[1]);
++                J.setZero();
++                J.block<3, 3>(0, 0) = w * Eigen::Matrix3d::Identity();
++            }
++        }
++        return true;
++    }
++};
