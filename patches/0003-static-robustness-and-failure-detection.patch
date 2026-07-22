@@ -1,17 +1,19 @@
 diff --git a/vins/src/estimator/estimator.cpp b/vins/src/estimator/estimator.cpp
-index 63a48d5..2cd3bd0 100755
+index ac014af..c081a05 100755
 --- a/vins/src/estimator/estimator.cpp
 +++ b/vins/src/estimator/estimator.cpp
-@@ -43,6 +43,8 @@ void Estimator::clearState()
+@@ -43,6 +43,10 @@ void Estimator::clearState()
      initR = Eigen::Matrix3d::Identity();
      inputImageCnt = 0;
      initFirstPoseFlag = false;
 +    is_static = false;
 +    static_count = 0;
++    no_vision_cnt = 0;
++    request_reset = false;
  
      for (int i = 0; i < WINDOW_SIZE + 1; i++)
      {
-@@ -233,6 +235,75 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
+@@ -233,6 +237,75 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
  }
  
  
@@ -87,7 +89,7 @@ index 63a48d5..2cd3bd0 100755
  bool Estimator::getIMUInterval(double t0, double t1, vector<pair<double, Eigen::Vector3d>> &accVector, 
                                  vector<pair<double, Eigen::Vector3d>> &gyrVector)
  {
-@@ -314,6 +385,8 @@ void Estimator::processMeasurements()
+@@ -314,6 +387,8 @@ void Estimator::processMeasurements()
              {
                  // cout << "2-1)" << endl;
                  getIMUInterval(prevTime, curTime, accVector, gyrVector);
@@ -96,7 +98,130 @@ index 63a48d5..2cd3bd0 100755
                  // cout << "2-2)" << endl;
              }
  
-@@ -1045,20 +1118,57 @@ void Estimator::double2vector()
+@@ -369,6 +444,16 @@ void Estimator::processMeasurements()
+             // cout << "5-6" << endl;
+             mProcess.unlock();
+ 
++            // 失效重置在这里做 —— 必须在 mProcess 解锁之后，
++            // 因为 clearState()/setParameter() 内部会自己加锁。
++            if (request_reset)
++            {
++                request_reset = false;
++                clearState();
++                setParameter();
++                ROS_WARN("system reboot!");
++            }
++
+ 
+             // cout << "6" << endl;
+ 
+@@ -398,6 +483,33 @@ void Estimator::initFirstIMUPose(vector<pair<double, Eigen::Vector3d>> &accVecto
+     }
+     averAcc = averAcc / n;
+     printf("averge acc %f %f %f\n", averAcc.x(), averAcc.y(), averAcc.z());
++
++    // 本地补丁：重力【模长】也用实测值，不要用配置里的固定 g_norm。
++    //
++    // 上游只用 averAcc 的方向定 R0，模长仍取配置里的 g_norm。但廉价 MEMS
++    // 加速度计有明显的标度误差和热漂: 本机 seeker1 实测静置 |a| 比当地真实
++    // 重力(约 9.79)高 2~3%，而且【一小时内就从 10.069 漂到 9.999】。
++    // 固定的 g_norm 必然对不上，差值成为恒定残差:
++    //     位置误差 ~ 0.5 * (|a| - g_norm) * t²
++    // 实测差 0.07 m/s² 时约 35 米/分钟，正是「静止却单方向持续漂移」的来源。
++    // 零偏本应吸收它，但静止时零偏与重力高度耦合、不总能收敛，实测约 4/5 的
++    // 启动里 Ba 一直停在 0，残差全部变成位置漂移。
++    //
++    // 这里在每次初始化(含失效检测重置后重新初始化)时直接采用当时的真实模长，
++    // 从源头消掉这个恒定残差，零偏只需处理其后的慢漂。
++    // 加合理性检查: 若初始化时平台在运动，averAcc 就不是纯重力，此时退回配置值。
++    {
++        const double g_meas = averAcc.norm();
++        if (g_meas > 9.0 && g_meas < 11.0) {
++            printf("g_norm: 配置 %.4f -> 实测 %.4f (差 %+.4f)\n",
++                   G.z(), g_meas, g_meas - G.z());
++            G.z() = g_meas;
++        } else {
++            printf("g_norm: 实测 %.4f 不合理(初始化时可能在运动)，沿用配置值 %.4f\n",
++                   g_meas, G.z());
++        }
++    }
++
+     Matrix3d R0 = Utility::g2R(averAcc);
+     double yaw = Utility::R2ypr(R0).x();
+     R0 = Utility::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0;
+@@ -470,6 +582,43 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
+         //printf("non-keyframe\n");
+     }
+ 
++    // -------------------------------------------------------------------------
++    // 本地补丁：滑窗停滞太久就强制产生关键帧
++    //
++    // 上游只用视差决定关键帧。相机静止时视差 ~= 0，于是每帧都走
++    // MARGIN_SECOND_NEW —— 这个分支只丢弃「次新帧」，窗口里 0..frame_count-2
++    // 这些帧被【冻结】，永远不再更新。后果有两个，第二个才是致命的：
++    //
++    //   1) IMU 预积分无界增长。slideWindow() 把新帧的 IMU 采样并入
++    //      pre_integrations[frame_count-1]（见本文件 slideWindow 内的
++    //      push_back），相机不动就一直并，sum_dt 一路涨，jacobian 超过 1e8
++    //      触发 "numerical unstable in preintegration"。
++    //
++    //   2) 特征饥饿（这才是发散的直接原因）。冻结的那些帧不再接收新观测，
++    //      新特征只能落在最后一个槽位上，攒不够 4 次观测；而优化器只用
++    //      used_num >= 4 的特征(见本文件 optimization() 内的判据)。老特征
++    //      随跟踪丢失逐个消亡后，参与优化的特征数变成 0，视觉约束彻底消失，
++    //      VINS 退化为纯 IMU 递推。实测静置桌面 5 分钟漂了 7.5 公里，
++    //      调试输出里 feat 一栏稳定为 0。
++    //
++    // 只调 keyframe_parallax 治不了本：那等于指望像素噪声或场景里有人走动去
++    // 超过阈值，画面真正静止时依然失效（实测阈值降到 0.3 照样漂公里级）。
++    //
++    // 关键是索引要对：真正无限增长的是 pre_integrations[frame_count - 1]
++    // （合并的目标），而不是 pre_integrations[frame_count]（它每帧都被重建，
++    // 恒等于一个图像周期，检查它等于没检查）。
++    //
++    // 0.5s 的取值：滑窗 10 帧，上限 0.5s 意味着窗口最长覆盖 5 秒，
++    // 零偏引起的位置误差 0.5*b*0.25 是厘米量级，优化器能正常吸收。
++    // 真实运动时每帧视差本就远超阈值，这条分支根本不会触发，对正常工况无影响。
++    // -------------------------------------------------------------------------
++    if (marginalization_flag == MARGIN_SECOND_NEW && USE_IMU && frame_count >= 1 &&
++        pre_integrations[frame_count - 1] != nullptr &&
++        pre_integrations[frame_count - 1]->sum_dt > MAX_KEYFRAME_INTERVAL)
++    {
++        marginalization_flag = MARGIN_OLD;
++    }
++
+     ROS_DEBUG("%s", marginalization_flag ? "Non-keyframe" : "Keyframe");
+     ROS_DEBUG("Solving %d", frame_count);
+     ROS_DEBUG("number of feature: %d", f_manager.getFeatureCount());
+@@ -607,9 +756,24 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
+         {
+             ROS_WARN("failure detection!");
+             failure_occur = 1;
+-            clearState();
+-            setParameter();
+-            ROS_WARN("system reboot!");
++            // 本地补丁：不能在这里就地 clearState()/setParameter()。
++            //
++            // processImage() 是在 processMeasurements() 持有 mProcess 的情况下
++            // 被调用的(见本文件 processMeasurements 里的 mProcess.lock())，
++            // 而 clearState() 和 setParameter() 内部都会【再次】mProcess.lock()。
++            // mProcess 是不可重入的 std::mutex(estimator.h) -> 自死锁，
++            // 估计器线程永久阻塞: 位姿输出停在触发那一帧、0 Hz，
++            // 而特征跟踪线程还在跑，所以进程看着像活着。
++            //
++            // 实测判定手法: "failure detection!" 打印了但紧随其后的
++            // "system reboot!" 一次都没打印，就是卡在了 clearState() 里。
++            //
++            // 这也是上游把 failureDetection() 用 return false 整个废掉的原因 ——
++            // 恢复路径从来就是死的，一启用就死锁。
++            //
++            // 改为置标志、由 processMeasurements 解锁后执行。
++            // 同一份代码里 changeSensorType() 用的就是这个写法(先 unlock 再调用)。
++            request_reset = true;
+             return;
+         }
+ 
+@@ -1008,20 +1172,80 @@ void Estimator::double2vector()
  
  bool Estimator::failureDetection()
  {
@@ -124,12 +249,35 @@ index 63a48d5..2cd3bd0 100755
 +    // 这里恢复检测。触发后上层会 clearState() + 重新初始化 —— 会丢掉地图，
 +    // 但远好过输出一个几公里外的假位姿。阈值都取得很宽松，只抓真正的失效。
 +    // -------------------------------------------------------------------------
-+    // 注意: 曾经加过「跟踪特征过少就判失效」，但运动中特征数正常起伏，
-+    // 会频繁误触发导致不断 clearState，反而比不检测更糟。已移除。
-+    if (Vs[WINDOW_SIZE].norm() > 20.0)
++    // 视觉约束真的没了 —— 这是「特征一丢就往一个方向疯狂发散」的直接判据。
++    //
++    // 判据选的是【参与优化的特征数】(used_num >= 4，与 optimization() 里
++    // estimator.cpp:1150 的条件一致)，而不是 last_track_num:
++    //   * last_track_num 是当前帧跟踪到的点数，运动中正常起伏很大，
++    //     拿它做判据会频繁误触发、不断 clearState，比不检测更糟(实测踩过)
++    //   * used_num>=4 的特征才真正进入 ceres 问题。这个数归零意味着
++    //     优化里【一条视觉约束都没有】，位姿完全由 IMU 递推决定 ——
++    //     恒定的零偏误差积分出去就是单方向发散，实测几秒内到几百米。
++    //
++    // 用连续计数做迟滞: 单帧掉零可能只是转身/遮挡的瞬间，能自行恢复；
++    // 连续 15 帧(约 1.5 秒)都为零才判定失效，避免误伤。
      {
 -        ROS_INFO(" little feature %d", f_manager.last_track_num);
 -        //return true;
++        int usable = 0;
++        for (auto &it : f_manager.feature)
++            if (it.feature_per_frame.size() >= 4) usable++;
++        if (usable < 5) ++no_vision_cnt; else no_vision_cnt = 0;
++        if (no_vision_cnt >= 15)
++        {
++            ROS_WARN("失效检测: 已连续 %d 帧没有可用视觉约束(可优化特征 %d 个) "
++                     "—— 视觉跟丢，正在重置", no_vision_cnt, usable);
++            no_vision_cnt = 0;
++            return true;
++        }
++    }
++    if (Vs[WINDOW_SIZE].norm() > 20.0)
++    {
 +        // 手持或小型无人机不可能到 20m/s。到这个量级说明已经在发散，
 +        // 早点重置比让它继续积分好。
 +        ROS_WARN("失效检测: 速度估计异常(%.1f m/s)", Vs[WINDOW_SIZE].norm());
@@ -160,7 +308,7 @@ index 63a48d5..2cd3bd0 100755
          return true;
      }
      /*
-@@ -1097,6 +1207,15 @@ void Estimator::optimization()
+@@ -1060,6 +1284,17 @@ void Estimator::optimization()
      TicToc t_whole, t_prepare;
      vector2double();
  
@@ -173,10 +321,12 @@ index 63a48d5..2cd3bd0 100755
 +            para_SpeedBias[i][0] = para_SpeedBias[i][1] = para_SpeedBias[i][2] = 0.0;
 +    }
 +
++    int _imu_add = 0, _imu_skip = 0; double _max_dt = 0, _min_dt = 1e9;
++
      ceres::Problem problem;
      ceres::LossFunction *loss_function;
      //loss_function = NULL;
-@@ -1108,7 +1227,26 @@ void Estimator::optimization()
+@@ -1071,7 +1306,26 @@ void Estimator::optimization()
          ceres::Manifold *local_parameterization = new PoseLocalParameterization();
          problem.AddParameterBlock(para_Pose[i], SIZE_POSE, local_parameterization);
          if(USE_IMU)
@@ -204,8 +354,18 @@ index 63a48d5..2cd3bd0 100755
      }
      if(!USE_IMU)
          problem.SetParameterBlockConstant(para_Pose[0]);
-@@ -1149,6 +1287,13 @@ void Estimator::optimization()
+@@ -1108,10 +1362,23 @@ void Estimator::optimization()
+         for (int i = 0; i < frame_count; i++)
+         {
+             int j = i + 1;
++            _max_dt = std::max(_max_dt, pre_integrations[j]->sum_dt);
++            _min_dt = std::min(_min_dt, pre_integrations[j]->sum_dt);
+             if (pre_integrations[j]->sum_dt > 10.0)
++            {
++                ++_imu_skip;
                  continue;
++            }
++            ++_imu_add;
              IMUFactor* imu_factor = new IMUFactor(pre_integrations[j]);
              problem.AddResidualBlock(imu_factor, NULL, para_Pose[i], para_SpeedBias[i], para_Pose[j], para_SpeedBias[j]);
 +
@@ -218,7 +378,18 @@ index 63a48d5..2cd3bd0 100755
          }
      }
  
-@@ -1225,6 +1370,18 @@ void Estimator::optimization()
+@@ -1185,9 +1452,29 @@ void Estimator::optimization()
+         options.max_solver_time_in_seconds = SOLVER_TIME * 4.0 / 5.0;
+     else
+         options.max_solver_time_in_seconds = SOLVER_TIME;
++    {
++        static int _pn = 0;
++        if (++_pn % 25 == 1)
++            printf("  PROBDBG 残差块=%d 参数块=%d | IMU因子 加%d 跳%d sum_dt[%.2f,%.2f] "
++                   "| 视觉观测=%d frame_count=%d\n",
++                   problem.NumResidualBlocks(), problem.NumParameterBlocks(),
++                   _imu_add, _imu_skip, _min_dt, _max_dt, f_m_cnt, frame_count);
++    }
      TicToc t_solver;
      ceres::Solver::Summary summary;
      ceres::Solve(options, &problem, &summary);
@@ -238,7 +409,7 @@ index 63a48d5..2cd3bd0 100755
      ROS_DEBUG("Iterations : %d", static_cast<int>(summary.iterations.size()));
      //printf("solver costs: %f \n", t_solver.toc());
 diff --git a/vins/src/estimator/estimator.h b/vins/src/estimator/estimator.h
-index bf27b8c..a446bd3 100755
+index bf27b8c..c4d0b99 100755
 --- a/vins/src/estimator/estimator.h
 +++ b/vins/src/estimator/estimator.h
 @@ -34,6 +34,7 @@
@@ -249,7 +420,7 @@ index bf27b8c..a446bd3 100755
  #include "../featureTracker/feature_tracker.h"
  
  #define ROS_INFO RCUTILS_LOG_INFO
-@@ -177,5 +178,13 @@ class Estimator
+@@ -177,5 +178,18 @@ class Estimator
      Eigen::Quaterniond latest_Q;
  
      bool initFirstPoseFlag;
@@ -261,6 +432,11 @@ index bf27b8c..a446bd3 100755
 +                      const std::vector<std::pair<double, Eigen::Vector3d>> &gyrVector);
 +    bool is_static;          // 当前是否判定为静止
 +    int  static_count;       // 连续判定为静止的区间数(用于迟滞)
++    int  no_vision_cnt;      // 连续多少帧没有可用视觉约束(失效检测用)
++    // 失效检测请求重置。实际的 clearState()/setParameter() 必须放到
++    // processMeasurements 解锁之后执行，不能在 processImage 里就地调用 ——
++    // 那样会自死锁，详见 estimator.cpp 里的说明。
++    bool request_reset;
      bool initThreadFlag;
  };
 diff --git a/vins/src/estimator/parameters.cpp b/vins/src/estimator/parameters.cpp
@@ -287,24 +463,6 @@ index 71afb67..df061f0 100755
      MIN_PARALLAX = fsSettings["keyframe_parallax"];
      MIN_PARALLAX = MIN_PARALLAX / FOCAL_LENGTH;
  
-diff --git a/vins/src/estimator/parameters.h b/vins/src/estimator/parameters.h
-index 6b20955..259e3d9 100755
---- a/vins/src/estimator/parameters.h
-+++ b/vins/src/estimator/parameters.h
-@@ -36,6 +36,13 @@ const double MAX_KEYFRAME_INTERVAL = 0.5;
- 
- extern double INIT_DEPTH;
- extern double MIN_PARALLAX;
-+// 零速修正开关(本项目新增)。默认关闭 —— 它只对「长时间静止」有益，
-+// 而运动中一旦静止误判就会把位置冻住，风险远大于收益。
-+// 需要长时间静置的场景才在配置里设 use_zupt: 1。
-+extern int USE_ZUPT;
-+// 失效检测开关(本项目新增)。上游把 failureDetection() 整个废掉了
-+// (第一行就是 return false)，这里恢复但默认仍不启用 —— 见 estimator.cpp 说明。
-+extern int USE_FAILURE_DETECTION;
- extern int ESTIMATE_EXTRINSIC;
- 
- extern int USE_GPU;
 diff --git a/vins/src/factor/zero_motion_factor.h b/vins/src/factor/zero_motion_factor.h
 new file mode 100644
 index 0000000..215f223
@@ -376,3 +534,26 @@ index 0000000..215f223
 +        return true;
 +    }
 +};
+diff --git a/vins/src/featureTracker/feature_tracker.cpp b/vins/src/featureTracker/feature_tracker.cpp
+index 3508bc0..356b58d 100755
+--- a/vins/src/featureTracker/feature_tracker.cpp
++++ b/vins/src/featureTracker/feature_tracker.cpp
+@@ -605,7 +605,17 @@ vector<cv::Point2f> FeatureTracker::ptsVelocity(vector<int> &ids, vector<cv::Poi
+     }
+ 
+     // caculate points velocity
+-    if (!prev_id_pts.empty())
++    //
++    // 本地补丁：dt <= 0 时不能做除法。
++    // 相机偶发给出重复时间戳(本机 seeker1 实测约 1%: 400 帧里 4~5 次)，
++    // 此时 dt = 0，下面的除法得到 Inf -> 投影因子算出 NaN ->
++    // Ceres 报 "Residual and Jacobian evaluation failed"，迭代 0 次直接放弃。
++    // NaN 一旦污染状态或边缘化先验，之后【每一帧】都失败(实测 133/132 帧全失败)，
++    // 优化器彻底停摆、所有状态冻结，位置只能靠 IMU 递推单方向发散。
++    // 表现为「间歇性坏初始化」——初始化那几秒撞上一次重复，整次运行就废了。
++    // 这里退化为速度全零(与没有上一帧时的处理一致)，代价只是这一帧不提供
++    // 时间偏移的观测，远好于让 NaN 毁掉整个估计器。
++    if (!prev_id_pts.empty() && cur_time - prev_time > 1e-9)
+     {
+         double dt = cur_time - prev_time;
+         

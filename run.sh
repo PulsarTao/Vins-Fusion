@@ -350,7 +350,11 @@ do_local_seeker() {
         local n=0
         while [ $n -lt 60 ]; do
             sleep 3; n=$((n+3))
-            [ "$(grep -c 'DBG V' "$HOME/vins_output/vins.log" 2>/dev/null || echo 0)" -gt 100 ] && break
+            # 注意 || true 不能写成 || echo 0: grep -c 计数为 0 时退出码是 1，
+            # 那样会拼出 "0\n0" 让 [ 报 integer expression expected
+            local cnt
+            cnt=$(grep -c 'DBG V' "$HOME/vins_output/vins.log" 2>/dev/null || true)
+            [ "${cnt:-0}" -gt 100 ] && break
         done
 
         # 健康判据: 加速度计零偏必须在被优化(取值有变化)。坏状态下它恒为 0.00000。

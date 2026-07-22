@@ -271,6 +271,25 @@ private:
       return;
     }
 
+    // ---- 丢弃时间戳重复的帧 ----
+    // 设备偶尔会连续两帧给出完全相同的时间戳，实测约 1%(400 帧里 4~5 次)。
+    // 后果极其严重且很隐蔽: VINS 用相邻帧时间差算特征速度
+    //     v = (cur_pts - prev_pts) / (cur_time - prev_time)
+    // dt=0 -> Inf -> 投影因子算出 NaN -> Ceres 报
+    //     "Residual and Jacobian evaluation failed"，迭代 0 次直接放弃。
+    // 而 NaN 一旦进入状态或边缘化先验，之后【每一帧】都失败(实测 133/132 帧
+    // 全部失败)，优化器彻底停摆、所有状态冻结，位置只能靠 IMU 递推单方向发散。
+    // 表现为「间歇性坏初始化」: 初始化那几秒撞上一次重复，这次运行就废了。
+    const double stamp_sec = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
+    if (stamp_sec <= last_stamp_) {
+        ++dropped_;
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                             "丢弃时间戳非递增的帧(累计 %zu 帧) —— 设备时间戳偶发重复",
+                             dropped_);
+        return;
+    }
+    last_stamp_ = stamp_sec;
+
     const int h = frame.rows / kNumCams;
     if (h != src_h_[0] || h != src_h_[1]) {
       RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -340,6 +359,8 @@ private:
   cv::Ptr<cv::CLAHE> clahe_impl_;
   std::string input_topic_;
   size_t count_{0};
+  double last_stamp_{-1.0};   // 上一帧时间戳，用于丢弃重复/倒退帧
+  size_t dropped_{0};
 };
 
 int main(int argc, char ** argv)

@@ -1,5 +1,5 @@
 diff --git a/vins/src/utility/visualization.cpp b/vins/src/utility/visualization.cpp
-index 8146f19..25b26ea 100755
+index 8146f19..ded5a44 100755
 --- a/vins/src/utility/visualization.cpp
 +++ b/vins/src/utility/visualization.cpp
 @@ -184,6 +184,24 @@ void pubOdometry(const Estimator &estimator, const std_msgs::msg::Header &header
@@ -19,11 +19,11 @@ index 8146f19..25b26ea 100755
 +            if (it.feature_per_frame.size() >= 4) n_feat++;
 +            for (auto &f : it.feature_per_frame) if (f.is_stereo) { n_stereo++; break; }
 +        }
-+        printf("  DBG V: %8.4f %8.4f %8.4f | Ba: %8.5f %8.5f %8.5f | Bg: %8.5f %8.5f %8.5f | feat: %d/%d 双目 %d\n",
++        printf("  DBG V: %8.4f %8.4f %8.4f | Ba: %8.5f %8.5f %8.5f | Bg: %8.5f %8.5f %8.5f | feat: %d/%d 双目 %d ZUPT:%d\n",
 +               estimator.Vs[WINDOW_SIZE].x(), estimator.Vs[WINDOW_SIZE].y(), estimator.Vs[WINDOW_SIZE].z(),
 +               estimator.Bas[WINDOW_SIZE].x(), estimator.Bas[WINDOW_SIZE].y(), estimator.Bas[WINDOW_SIZE].z(),
 +               estimator.Bgs[WINDOW_SIZE].x(), estimator.Bgs[WINDOW_SIZE].y(), estimator.Bgs[WINDOW_SIZE].z(),
-+               n_feat, n_all, n_stereo);
++               n_feat, n_all, n_stereo, estimator.is_static ? 1 : 0);
      }
  }
  
