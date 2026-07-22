@@ -1,5 +1,5 @@
 diff --git a/vins/src/estimator/estimator.cpp b/vins/src/estimator/estimator.cpp
-index 63a48d5..a1dc4ad 100755
+index 63a48d5..2cd3bd0 100755
 --- a/vins/src/estimator/estimator.cpp
 +++ b/vins/src/estimator/estimator.cpp
 @@ -43,6 +43,8 @@ void Estimator::clearState()
@@ -11,7 +11,7 @@ index 63a48d5..a1dc4ad 100755
  
      for (int i = 0; i < WINDOW_SIZE + 1; i++)
      {
-@@ -233,6 +235,74 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
+@@ -233,6 +235,75 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
  }
  
  
@@ -62,6 +62,7 @@ index 63a48d5..a1dc4ad 100755
 +
 +        moving = (a_std > ACC_STD_TH) || (g_std > GYR_STD_TH) ||
 +                 (std::fabs(am.norm() - G.norm()) > G_DEV_TH);
++
 +    }
 +
 +    if (moving)
@@ -86,20 +87,28 @@ index 63a48d5..a1dc4ad 100755
  bool Estimator::getIMUInterval(double t0, double t1, vector<pair<double, Eigen::Vector3d>> &accVector, 
                                  vector<pair<double, Eigen::Vector3d>> &gyrVector)
  {
-@@ -314,6 +384,7 @@ void Estimator::processMeasurements()
+@@ -314,6 +385,8 @@ void Estimator::processMeasurements()
              {
                  // cout << "2-1)" << endl;
                  getIMUInterval(prevTime, curTime, accVector, gyrVector);
-+                detectStatic(accVector, gyrVector);   // ZUPT: 更新静止判定
++                if (USE_ZUPT)
++                    detectStatic(accVector, gyrVector);   // ZUPT: 更新静止判定
                  // cout << "2-2)" << endl;
              }
  
-@@ -1045,20 +1116,53 @@ void Estimator::double2vector()
+@@ -1045,20 +1118,57 @@ void Estimator::double2vector()
  
  bool Estimator::failureDetection()
  {
 -    return false;
 -    if (f_manager.last_track_num < 2)
++    // 默认沿用上游行为(不检测)。上游把整个函数体废掉是有代价的 ——
++    // 视觉跟踪垮掉时它会静默发散；但实测启用后 clearState() 的恢复路径
++    // 并不可靠，而且阈值稍紧就会在正常运动中误触发、把好的估计重置掉。
++    // 两害相权，默认关闭，需要时在配置里设 use_failure_detection: 1。
++    if (!USE_FAILURE_DETECTION)
++        return false;
++
 +    // -------------------------------------------------------------------------
 +    // 本地补丁：启用失效检测
 +    //
@@ -115,16 +124,12 @@ index 63a48d5..a1dc4ad 100755
 +    // 这里恢复检测。触发后上层会 clearState() + 重新初始化 —— 会丢掉地图，
 +    // 但远好过输出一个几公里外的假位姿。阈值都取得很宽松，只抓真正的失效。
 +    // -------------------------------------------------------------------------
-+    if (f_manager.last_track_num < 8)
++    // 注意: 曾经加过「跟踪特征过少就判失效」，但运动中特征数正常起伏，
++    // 会频繁误触发导致不断 clearState，反而比不检测更糟。已移除。
++    if (Vs[WINDOW_SIZE].norm() > 20.0)
      {
 -        ROS_INFO(" little feature %d", f_manager.last_track_num);
 -        //return true;
-+        ROS_WARN("失效检测: 跟踪特征过少(%d) —— 场景可能过暗/无纹理/被遮挡",
-+                 f_manager.last_track_num);
-+        return true;
-+    }
-+    if (Vs[WINDOW_SIZE].norm() > 20.0)
-+    {
 +        // 手持或小型无人机不可能到 20m/s。到这个量级说明已经在发散，
 +        // 早点重置比让它继续积分好。
 +        ROS_WARN("失效检测: 速度估计异常(%.1f m/s)", Vs[WINDOW_SIZE].norm());
@@ -146,15 +151,16 @@ index 63a48d5..a1dc4ad 100755
 +    // (相邻两帧间隔 0.1s，等于 3255 m/s)，是优化器一次灾难性迭代步的结果，
 +    // 不是渐进漂移。这类退化无法彻底避免(静止本就是 VIO 的退化构型)，
 +    // 但绝不能静默输出 —— 下游飞控拿到这种位姿会直接失控。
-+    // 阈值 0.5m/帧 对手持或小型无人机已经很宽松(相当于 5 m/s)。
-+    if ((Ps[WINDOW_SIZE] - last_P).norm() > 0.5)
++    // 阈值取 5m/帧(相当于 50 m/s)，只抓真正的灾难性突变。
++    // 早前用过 0.5m 的紧阈值，运动时会误触发，反而把好的估计重置掉。
++    if ((Ps[WINDOW_SIZE] - last_P).norm() > 5.0)
 +    {
 +        ROS_WARN("失效检测: 单帧位置跳变 %.2f m —— 优化器发散",
 +                 (Ps[WINDOW_SIZE] - last_P).norm());
          return true;
      }
      /*
-@@ -1097,6 +1201,15 @@ void Estimator::optimization()
+@@ -1097,6 +1207,15 @@ void Estimator::optimization()
      TicToc t_whole, t_prepare;
      vector2double();
  
@@ -170,7 +176,7 @@ index 63a48d5..a1dc4ad 100755
      ceres::Problem problem;
      ceres::LossFunction *loss_function;
      //loss_function = NULL;
-@@ -1108,7 +1221,26 @@ void Estimator::optimization()
+@@ -1108,7 +1227,26 @@ void Estimator::optimization()
          ceres::Manifold *local_parameterization = new PoseLocalParameterization();
          problem.AddParameterBlock(para_Pose[i], SIZE_POSE, local_parameterization);
          if(USE_IMU)
@@ -198,7 +204,7 @@ index 63a48d5..a1dc4ad 100755
      }
      if(!USE_IMU)
          problem.SetParameterBlockConstant(para_Pose[0]);
-@@ -1149,6 +1281,13 @@ void Estimator::optimization()
+@@ -1149,6 +1287,13 @@ void Estimator::optimization()
                  continue;
              IMUFactor* imu_factor = new IMUFactor(pre_integrations[j]);
              problem.AddResidualBlock(imu_factor, NULL, para_Pose[i], para_SpeedBias[i], para_Pose[j], para_SpeedBias[j]);
@@ -212,7 +218,7 @@ index 63a48d5..a1dc4ad 100755
          }
      }
  
-@@ -1225,6 +1364,18 @@ void Estimator::optimization()
+@@ -1225,6 +1370,18 @@ void Estimator::optimization()
      TicToc t_solver;
      ceres::Solver::Summary summary;
      ceres::Solve(options, &problem, &summary);
@@ -257,6 +263,48 @@ index bf27b8c..a446bd3 100755
 +    int  static_count;       // 连续判定为静止的区间数(用于迟滞)
      bool initThreadFlag;
  };
+diff --git a/vins/src/estimator/parameters.cpp b/vins/src/estimator/parameters.cpp
+index 71afb67..df061f0 100755
+--- a/vins/src/estimator/parameters.cpp
++++ b/vins/src/estimator/parameters.cpp
+@@ -28,6 +28,8 @@ double BIAS_GYR_THRESHOLD;
+ double SOLVER_TIME;
+ int NUM_ITERATIONS;
+ int ESTIMATE_EXTRINSIC;
++int USE_ZUPT;
++int USE_FAILURE_DETECTION;
+ int ESTIMATE_TD;
+ int ROLLING_SHUTTER;
+ std::string EX_CALIB_RESULT_PATH;
+@@ -116,6 +118,10 @@ void readParameters(std::string config_file)
+ 
+     SOLVER_TIME = fsSettings["max_solver_time"];
+     NUM_ITERATIONS = fsSettings["max_num_iterations"];
++    USE_ZUPT = fsSettings["use_zupt"].empty() ? 0 : (int)fsSettings["use_zupt"];
++    printf("use_zupt %d\n", USE_ZUPT);
++    USE_FAILURE_DETECTION = fsSettings["use_failure_detection"].empty() ? 0 : (int)fsSettings["use_failure_detection"];
++    printf("use_failure_detection %d\n", USE_FAILURE_DETECTION);
+     MIN_PARALLAX = fsSettings["keyframe_parallax"];
+     MIN_PARALLAX = MIN_PARALLAX / FOCAL_LENGTH;
+ 
+diff --git a/vins/src/estimator/parameters.h b/vins/src/estimator/parameters.h
+index 6b20955..259e3d9 100755
+--- a/vins/src/estimator/parameters.h
++++ b/vins/src/estimator/parameters.h
+@@ -36,6 +36,13 @@ const double MAX_KEYFRAME_INTERVAL = 0.5;
+ 
+ extern double INIT_DEPTH;
+ extern double MIN_PARALLAX;
++// 零速修正开关(本项目新增)。默认关闭 —— 它只对「长时间静止」有益，
++// 而运动中一旦静止误判就会把位置冻住，风险远大于收益。
++// 需要长时间静置的场景才在配置里设 use_zupt: 1。
++extern int USE_ZUPT;
++// 失效检测开关(本项目新增)。上游把 failureDetection() 整个废掉了
++// (第一行就是 return false)，这里恢复但默认仍不启用 —— 见 estimator.cpp 说明。
++extern int USE_FAILURE_DETECTION;
+ extern int ESTIMATE_EXTRINSIC;
+ 
+ extern int USE_GPU;
 diff --git a/vins/src/factor/zero_motion_factor.h b/vins/src/factor/zero_motion_factor.h
 new file mode 100644
 index 0000000..215f223
