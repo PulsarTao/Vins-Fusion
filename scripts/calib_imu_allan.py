@@ -100,6 +100,36 @@ def allan_csv(t, acc, gyr, out_csv):
     return fs, len(rows)
 
 
+def clean_segment(t, acc, gyr):
+    """自动截取最长的静置段。
+
+    实际录制中很难保证全程没人碰到设备/桌子，而 Allan 方差要求数据【严格静置】——
+    哪怕几秒的扰动也会把长 tau 段的估计整个抬高。这里用 1 秒窗口的标准差
+    找出扰动时段(阈值取静置基线的 10 倍)，返回最长的连续干净段。
+    """
+    fs = (len(t) - 1) / (t[-1] - t[0])
+    w = max(1, int(fs))
+    n = len(t) // w
+    a = acc[:n * w].reshape(n, w, 3).std(axis=1).max(axis=1)
+    g = gyr[:n * w].reshape(n, w, 3).std(axis=1).max(axis=1)
+    bad = (a > np.percentile(a, 20) * 10) | (g > np.percentile(g, 20) * 10)
+
+    best = (0, 0)
+    cur = 0
+    for i, b in enumerate(bad):
+        if b:
+            cur = 0
+        else:
+            cur += 1
+            if cur > best[1] - best[0]:
+                best = (i - cur + 1, i + 1)
+    s, e = best[0] * w, best[1] * w
+    if bad.sum():
+        print(f'  检测到 {int(bad.sum())} 秒受扰动，'
+              f'截取最长干净段: {(e-s)/fs/60:.1f} 分钟 (原 {len(t)/fs/60:.1f} 分钟)')
+    return t[s:e], acc[s:e], gyr[s:e]
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
@@ -111,8 +141,10 @@ def main():
     t, acc, gyr = read_bag(bag)
     if len(t) < 10000:
         sys.exit(f'✗ 只有 {len(t)} 条 IMU 数据，太少')
+    print(f'  {len(t)} 条, 时长 {(t[-1]-t[0])/60:.1f} 分钟, '
+          f'频率 {(len(t)-1)/(t[-1]-t[0]):.1f} Hz')
+    t, acc, gyr = clean_segment(t, acc, gyr)
     dur = t[-1] - t[0]
-    print(f'  {len(t)} 条, 时长 {dur/60:.1f} 分钟, 频率 {(len(t)-1)/dur:.1f} Hz')
     if dur < 3600:
         print(f'  ⚠ 时长不足 1 小时。allan_variance_ros 建议至少 3 小时 —— '
               f'长 tau 段(零偏随机游走)的估计会不可靠')

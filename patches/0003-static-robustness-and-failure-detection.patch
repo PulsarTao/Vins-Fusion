@@ -1,5 +1,5 @@
 diff --git a/vins/src/estimator/estimator.cpp b/vins/src/estimator/estimator.cpp
-index ac014af..88df6c3 100755
+index ac014af..9ac3577 100755
 --- a/vins/src/estimator/estimator.cpp
 +++ b/vins/src/estimator/estimator.cpp
 @@ -43,6 +43,22 @@ void Estimator::clearState()
@@ -25,7 +25,7 @@ index ac014af..88df6c3 100755
  
      for (int i = 0; i < WINDOW_SIZE + 1; i++)
      {
-@@ -233,6 +249,75 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
+@@ -233,6 +249,78 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
  }
  
  
@@ -51,7 +51,10 @@ index ac014af..88df6c3 100755
 +    const double ACC_STD_TH = 0.06;      // m/s²
 +    const double GYR_STD_TH = 0.008;     // rad/s
 +    const double G_DEV_TH   = 0.5;       // m/s²，比力模长偏离重力的容许量
-+    const int    HOLD_N     = 5;         // 迟滞: 需连续多少个区间
++    // 迟滞: 需连续多少个图像区间判定为静止才进入静止态。
++    // 取 10(约 1 秒)而不是 5 —— ZUPT 误判的代价是把运动中的位置冻住，
++    // 远比"少修正一点漂移"严重，所以进入要慢、退出要快(见下面 moving 分支)。
++    const int    HOLD_N     = 10;
 +
 +    bool moving = true;
 +    if (accVector.size() >= 5 && gyrVector.size() == accVector.size())
@@ -101,7 +104,7 @@ index ac014af..88df6c3 100755
  bool Estimator::getIMUInterval(double t0, double t1, vector<pair<double, Eigen::Vector3d>> &accVector, 
                                  vector<pair<double, Eigen::Vector3d>> &gyrVector)
  {
-@@ -314,6 +399,8 @@ void Estimator::processMeasurements()
+@@ -314,6 +402,8 @@ void Estimator::processMeasurements()
              {
                  // cout << "2-1)" << endl;
                  getIMUInterval(prevTime, curTime, accVector, gyrVector);
@@ -110,7 +113,7 @@ index ac014af..88df6c3 100755
                  // cout << "2-2)" << endl;
              }
  
-@@ -369,6 +456,16 @@ void Estimator::processMeasurements()
+@@ -369,6 +459,16 @@ void Estimator::processMeasurements()
              // cout << "5-6" << endl;
              mProcess.unlock();
  
@@ -127,7 +130,7 @@ index ac014af..88df6c3 100755
  
              // cout << "6" << endl;
  
-@@ -398,6 +495,33 @@ void Estimator::initFirstIMUPose(vector<pair<double, Eigen::Vector3d>> &accVecto
+@@ -398,6 +498,33 @@ void Estimator::initFirstIMUPose(vector<pair<double, Eigen::Vector3d>> &accVecto
      }
      averAcc = averAcc / n;
      printf("averge acc %f %f %f\n", averAcc.x(), averAcc.y(), averAcc.z());
@@ -161,7 +164,7 @@ index ac014af..88df6c3 100755
      Matrix3d R0 = Utility::g2R(averAcc);
      double yaw = Utility::R2ypr(R0).x();
      R0 = Utility::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0;
-@@ -470,6 +594,43 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
+@@ -470,6 +597,43 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
          //printf("non-keyframe\n");
      }
  
@@ -205,7 +208,7 @@ index ac014af..88df6c3 100755
      ROS_DEBUG("%s", marginalization_flag ? "Non-keyframe" : "Keyframe");
      ROS_DEBUG("Solving %d", frame_count);
      ROS_DEBUG("number of feature: %d", f_manager.getFeatureCount());
-@@ -607,9 +768,24 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
+@@ -607,9 +771,24 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
          {
              ROS_WARN("failure detection!");
              failure_occur = 1;
@@ -233,7 +236,7 @@ index ac014af..88df6c3 100755
              return;
          }
  
-@@ -1008,20 +1184,80 @@ void Estimator::double2vector()
+@@ -1008,20 +1187,80 @@ void Estimator::double2vector()
  
  bool Estimator::failureDetection()
  {
@@ -320,7 +323,7 @@ index ac014af..88df6c3 100755
          return true;
      }
      /*
-@@ -1060,6 +1296,18 @@ void Estimator::optimization()
+@@ -1060,6 +1299,18 @@ void Estimator::optimization()
      TicToc t_whole, t_prepare;
      vector2double();
  
@@ -339,7 +342,7 @@ index ac014af..88df6c3 100755
      ceres::Problem problem;
      ceres::LossFunction *loss_function;
      //loss_function = NULL;
-@@ -1071,7 +1319,26 @@ void Estimator::optimization()
+@@ -1071,7 +1322,26 @@ void Estimator::optimization()
          ceres::Manifold *local_parameterization = new PoseLocalParameterization();
          problem.AddParameterBlock(para_Pose[i], SIZE_POSE, local_parameterization);
          if(USE_IMU)
@@ -367,7 +370,7 @@ index ac014af..88df6c3 100755
      }
      if(!USE_IMU)
          problem.SetParameterBlockConstant(para_Pose[0]);
-@@ -1100,18 +1367,48 @@ void Estimator::optimization()
+@@ -1100,18 +1370,48 @@ void Estimator::optimization()
      {
          // construct new marginlization_factor
          MarginalizationFactor *marginalization_factor = new MarginalizationFactor(last_marginalization_info);
@@ -420,7 +423,7 @@ index ac014af..88df6c3 100755
          }
      }
  
-@@ -1137,7 +1434,7 @@ void Estimator::optimization()
+@@ -1137,7 +1437,7 @@ void Estimator::optimization()
                  Vector3d pts_j = it_per_frame.point;
                  ProjectionTwoFrameOneCamFactor *f_td = new ProjectionTwoFrameOneCamFactor(pts_i, pts_j, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocity,
                                                                   it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
@@ -429,7 +432,7 @@ index ac014af..88df6c3 100755
              }
  
              if(STEREO && it_per_frame.is_stereo)
-@@ -1147,18 +1444,37 @@ void Estimator::optimization()
+@@ -1147,18 +1447,37 @@ void Estimator::optimization()
                  {
                      ProjectionTwoFrameTwoCamFactor *f = new ProjectionTwoFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
                                                                   it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
@@ -469,7 +472,7 @@ index ac014af..88df6c3 100755
      }
  
      ROS_DEBUG("visual measurement count: %d", f_m_cnt);
-@@ -1185,9 +1501,111 @@ void Estimator::optimization()
+@@ -1185,9 +1504,111 @@ void Estimator::optimization()
          options.max_solver_time_in_seconds = SOLVER_TIME * 4.0 / 5.0;
      else
          options.max_solver_time_in_seconds = SOLVER_TIME;
