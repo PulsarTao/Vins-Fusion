@@ -1,8 +1,8 @@
 diff --git a/vins/src/estimator/estimator.cpp b/vins/src/estimator/estimator.cpp
-index ac014af..c081a05 100755
+index ac014af..88df6c3 100755
 --- a/vins/src/estimator/estimator.cpp
 +++ b/vins/src/estimator/estimator.cpp
-@@ -43,6 +43,10 @@ void Estimator::clearState()
+@@ -43,6 +43,22 @@ void Estimator::clearState()
      initR = Eigen::Matrix3d::Identity();
      inputImageCnt = 0;
      initFirstPoseFlag = false;
@@ -10,10 +10,22 @@ index ac014af..c081a05 100755
 +    static_count = 0;
 +    no_vision_cnt = 0;
 +    request_reset = false;
++
++    // 本地补丁：last_P/last_R 也必须清。
++    // 上游 clearState() 只清了 last_marginalization_*，漏了这四个 ——
++    // 在失效检测被禁用时无害，一旦启用就是重置死循环:
++    // 重置后 Ps 归零而 last_P 仍是发散前的旧值，failureDetection() 里的
++    //     (Ps[WINDOW_SIZE] - last_P).norm() > 5.0
++    // 立刻又超阈值，于是不停重置。实测同一个 "单帧位置跳变 9.62 m" 连报 60 次，
++    // 数值一字不差就是这个原因。
++    last_P.setZero();
++    last_R.setIdentity();
++    last_P0.setZero();
++    last_R0.setIdentity();
  
      for (int i = 0; i < WINDOW_SIZE + 1; i++)
      {
-@@ -233,6 +237,75 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
+@@ -233,6 +249,75 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
  }
  
  
@@ -89,7 +101,7 @@ index ac014af..c081a05 100755
  bool Estimator::getIMUInterval(double t0, double t1, vector<pair<double, Eigen::Vector3d>> &accVector, 
                                  vector<pair<double, Eigen::Vector3d>> &gyrVector)
  {
-@@ -314,6 +387,8 @@ void Estimator::processMeasurements()
+@@ -314,6 +399,8 @@ void Estimator::processMeasurements()
              {
                  // cout << "2-1)" << endl;
                  getIMUInterval(prevTime, curTime, accVector, gyrVector);
@@ -98,7 +110,7 @@ index ac014af..c081a05 100755
                  // cout << "2-2)" << endl;
              }
  
-@@ -369,6 +444,16 @@ void Estimator::processMeasurements()
+@@ -369,6 +456,16 @@ void Estimator::processMeasurements()
              // cout << "5-6" << endl;
              mProcess.unlock();
  
@@ -115,7 +127,7 @@ index ac014af..c081a05 100755
  
              // cout << "6" << endl;
  
-@@ -398,6 +483,33 @@ void Estimator::initFirstIMUPose(vector<pair<double, Eigen::Vector3d>> &accVecto
+@@ -398,6 +495,33 @@ void Estimator::initFirstIMUPose(vector<pair<double, Eigen::Vector3d>> &accVecto
      }
      averAcc = averAcc / n;
      printf("averge acc %f %f %f\n", averAcc.x(), averAcc.y(), averAcc.z());
@@ -149,7 +161,7 @@ index ac014af..c081a05 100755
      Matrix3d R0 = Utility::g2R(averAcc);
      double yaw = Utility::R2ypr(R0).x();
      R0 = Utility::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0;
-@@ -470,6 +582,43 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
+@@ -470,6 +594,43 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
          //printf("non-keyframe\n");
      }
  
@@ -193,7 +205,7 @@ index ac014af..c081a05 100755
      ROS_DEBUG("%s", marginalization_flag ? "Non-keyframe" : "Keyframe");
      ROS_DEBUG("Solving %d", frame_count);
      ROS_DEBUG("number of feature: %d", f_manager.getFeatureCount());
-@@ -607,9 +756,24 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
+@@ -607,9 +768,24 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
          {
              ROS_WARN("failure detection!");
              failure_occur = 1;
@@ -221,7 +233,7 @@ index ac014af..c081a05 100755
              return;
          }
  
-@@ -1008,20 +1172,80 @@ void Estimator::double2vector()
+@@ -1008,20 +1184,80 @@ void Estimator::double2vector()
  
  bool Estimator::failureDetection()
  {
@@ -308,7 +320,7 @@ index ac014af..c081a05 100755
          return true;
      }
      /*
-@@ -1060,6 +1284,17 @@ void Estimator::optimization()
+@@ -1060,6 +1296,18 @@ void Estimator::optimization()
      TicToc t_whole, t_prepare;
      vector2double();
  
@@ -322,11 +334,12 @@ index ac014af..c081a05 100755
 +    }
 +
 +    int _imu_add = 0, _imu_skip = 0; double _max_dt = 0, _min_dt = 1e9;
++    std::vector<ceres::ResidualBlockId> _rb_marg, _rb_imu, _rb_vis;
 +
      ceres::Problem problem;
      ceres::LossFunction *loss_function;
      //loss_function = NULL;
-@@ -1071,7 +1306,26 @@ void Estimator::optimization()
+@@ -1071,7 +1319,26 @@ void Estimator::optimization()
          ceres::Manifold *local_parameterization = new PoseLocalParameterization();
          problem.AddParameterBlock(para_Pose[i], SIZE_POSE, local_parameterization);
          if(USE_IMU)
@@ -354,20 +367,49 @@ index ac014af..c081a05 100755
      }
      if(!USE_IMU)
          problem.SetParameterBlockConstant(para_Pose[0]);
-@@ -1108,10 +1362,23 @@ void Estimator::optimization()
+@@ -1100,18 +1367,48 @@ void Estimator::optimization()
+     {
+         // construct new marginlization_factor
+         MarginalizationFactor *marginalization_factor = new MarginalizationFactor(last_marginalization_info);
+-        problem.AddResidualBlock(marginalization_factor, NULL,
+-                                 last_marginalization_parameter_blocks);
++        _rb_marg.push_back(problem.AddResidualBlock(marginalization_factor, NULL,
++                                 last_marginalization_parameter_blocks));
+     }
+     if(USE_IMU)
+     {
          for (int i = 0; i < frame_count; i++)
          {
              int j = i + 1;
+-            if (pre_integrations[j]->sum_dt > 10.0)
 +            _max_dt = std::max(_max_dt, pre_integrations[j]->sum_dt);
 +            _min_dt = std::min(_min_dt, pre_integrations[j]->sum_dt);
-             if (pre_integrations[j]->sum_dt > 10.0)
++            // 本地补丁：预积分数值失效时【跳过】该 IMU 因子，而不是照样塞进优化。
++            //
++            // 上游在 imu_factor.h 里已经检测了 jacobian.maxCoeff() > 1e8
++            // ("numerical unstable in preintegration")，但只打印警告，
++            // ROS_BREAK() 被注释掉了，因子照样加入问题。后果实测如下:
++            // 雅可比进入 corrected_delta_p/v/q 后被放大成 ~1e21 的残差，
++            // IMU 因子代价冲到 1e42(同一次求解里视觉代价只有 4.7e4，完全正常)，
++            // Ceres 在这个量级上迭代 1 次就报"收敛"(任何一步的相对改善都低于容差)，
++            // 所有状态原封不动；污染随后被写进边缘化先验，之后每帧都带着它。
++            // 表现就是「间歇性坏初始化」: Ba/Bg 精确冻结、位置纯 IMU 递推漂十几米。
++            //
++            // 用与上游相同的阈值判定，判定为失效就跳过 —— 少一个约束，
++            // 远好于让一个 1e21 的残差毁掉整个优化。
++            const double _jmax = pre_integrations[j]->jacobian.maxCoeff();
++            const double _jmin = pre_integrations[j]->jacobian.minCoeff();
++            if (pre_integrations[j]->sum_dt > 10.0 ||
++                !std::isfinite(_jmax) || !std::isfinite(_jmin) ||
++                _jmax > 1e8 || _jmin < -1e8)
 +            {
 +                ++_imu_skip;
                  continue;
 +            }
 +            ++_imu_add;
              IMUFactor* imu_factor = new IMUFactor(pre_integrations[j]);
-             problem.AddResidualBlock(imu_factor, NULL, para_Pose[i], para_SpeedBias[i], para_Pose[j], para_SpeedBias[j]);
+-            problem.AddResidualBlock(imu_factor, NULL, para_Pose[i], para_SpeedBias[i], para_Pose[j], para_SpeedBias[j]);
++            _rb_imu.push_back(problem.AddResidualBlock(imu_factor, NULL, para_Pose[i], para_SpeedBias[i], para_Pose[j], para_SpeedBias[j]));
 +
 +            // 零运动约束: 静止时窗口内相邻帧不应产生位移。
 +            // 这是【相对】约束，不与边缘化先验争夺绝对位置；配合被冻结的速度，
@@ -378,26 +420,157 @@ index ac014af..c081a05 100755
          }
      }
  
-@@ -1185,9 +1452,29 @@ void Estimator::optimization()
+@@ -1137,7 +1434,7 @@ void Estimator::optimization()
+                 Vector3d pts_j = it_per_frame.point;
+                 ProjectionTwoFrameOneCamFactor *f_td = new ProjectionTwoFrameOneCamFactor(pts_i, pts_j, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocity,
+                                                                  it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
+-                problem.AddResidualBlock(f_td, loss_function, para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]);
++                _rb_vis.push_back(problem.AddResidualBlock(f_td, loss_function, para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]));
+             }
+ 
+             if(STEREO && it_per_frame.is_stereo)
+@@ -1147,18 +1444,37 @@ void Estimator::optimization()
+                 {
+                     ProjectionTwoFrameTwoCamFactor *f = new ProjectionTwoFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
+                                                                  it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
+-                    problem.AddResidualBlock(f, loss_function, para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]);
++                    _rb_vis.push_back(problem.AddResidualBlock(f, loss_function, para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]));
+                 }
+                 else
+                 {
+                     ProjectionOneFrameTwoCamFactor *f = new ProjectionOneFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
+                                                                  it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
+-                    problem.AddResidualBlock(f, loss_function, para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]);
++                    _rb_vis.push_back(problem.AddResidualBlock(f, loss_function, para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]));
+                 }
+                
+             }
+             f_m_cnt++;
+         }
++
++        // 本地补丁：给逆深度加上下界。
++        //
++        // VINS 用逆深度参数化特征(para_Feature = 1/depth)，但上游不对它设界。
++        // 优化过程中逆深度可以被推到趋近 0(深度趋近无穷)甚至为负，
++        // 投影因子里一除就得到 1e20 量级的残差，代价冲到 1e40 以上。
++        // 此时 Ceres 只迭代 1 次就报"收敛"(在这个量级上任何一步的相对改善
++        // 都低于容差)，整个优化停摆 —— 这是「间歇性坏初始化」的另一半原因。
++        // (另一半是三角化没有深度上界，已在 feature_manager.cpp 修复。)
++        //
++        // 区间与三角化的保护一致: 深度 0.1~100 米 -> 逆深度 0.01~10。
++        // 本机双目基线仅 4.6cm，100 米处视差 0.15 像素，深度本就不可信。
++        if (problem.HasParameterBlock(para_Feature[feature_index]))
++        {
++            problem.SetParameterLowerBound(para_Feature[feature_index], 0,
++                                           1.0 / MAX_TRIANGULATE_DEPTH);
++            problem.SetParameterUpperBound(para_Feature[feature_index], 0,
++                                           1.0 / MIN_TRIANGULATE_DEPTH);
++        }
+     }
+ 
+     ROS_DEBUG("visual measurement count: %d", f_m_cnt);
+@@ -1185,9 +1501,111 @@ void Estimator::optimization()
          options.max_solver_time_in_seconds = SOLVER_TIME * 4.0 / 5.0;
      else
          options.max_solver_time_in_seconds = SOLVER_TIME;
 +    {
 +        static int _pn = 0;
 +        if (++_pn % 25 == 1)
++        {
++            bool sb_const = USE_IMU && problem.HasParameterBlock(para_SpeedBias[0])
++                            && problem.IsParameterBlockConstant(para_SpeedBias[0]);
++            bool pz_const = problem.HasParameterBlock(para_Pose[0])
++                            && problem.IsParameterBlockConstant(para_Pose[0]);
 +            printf("  PROBDBG 残差块=%d 参数块=%d | IMU因子 加%d 跳%d sum_dt[%.2f,%.2f] "
-+                   "| 视觉观测=%d frame_count=%d\n",
++                   "| 视觉=%d fc=%d | SpeedBias常量=%d Pose0常量=%d is_static=%d "
++                   "| Ba=[%.5f %.5f %.5f]\n",
 +                   problem.NumResidualBlocks(), problem.NumParameterBlocks(),
-+                   _imu_add, _imu_skip, _min_dt, _max_dt, f_m_cnt, frame_count);
++                   _imu_add, _imu_skip, _min_dt, _max_dt, f_m_cnt, frame_count,
++                   sb_const?1:0, pz_const?1:0, is_static?1:0,
++                   para_SpeedBias[WINDOW_SIZE][3], para_SpeedBias[WINDOW_SIZE][4],
++                   para_SpeedBias[WINDOW_SIZE][5]);
++        }
++    }
++    {
++        static int _en = 0;
++        if (++_en % 25 == 1)
++        {
++            auto grp=[&](std::vector<ceres::ResidualBlockId>&v, const char*nm){
++                if (v.empty()) { printf("  %s: (无)", nm); return; }
++                ceres::Problem::EvaluateOptions eo; eo.residual_blocks=v; eo.apply_loss_function=false;
++                double c=0; std::vector<double> r;
++                problem.Evaluate(eo,&c,&r,nullptr,nullptr);
++                double mx=0; for(double x:r) mx=std::max(mx,std::abs(x));
++                printf("  %s: 块%zu 代价%.3e 最大残差%.3e", nm, v.size(), c, mx);
++            };
++            printf("  COSTDBG");
++            grp(_rb_marg,"边缘化"); grp(_rb_imu,"IMU"); grp(_rb_vis,"视觉");
++            printf("\n");
++            for (int i = 0; i < frame_count; i++)
++            {
++                auto *pi = pre_integrations[i+1];
++                if (!pi) continue;
++                printf("    IMU[%d] sum_dt=%.3f |dp|=%.3e |dv|=%.3e jmax=%.3e "
++                       "cov_min=%.3e |Ps|=%.2f |Vs|=%.2f\n",
++                       i+1, pi->sum_dt, pi->delta_p.norm(), pi->delta_v.norm(),
++                       pi->jacobian.cwiseAbs().maxCoeff(),
++                       pi->covariance.diagonal().minCoeff(),
++                       Ps[i+1].norm(), Vs[i+1].norm());
++            }
++        }
 +    }
      TicToc t_solver;
      ceres::Solver::Summary summary;
++    double _ba_before[3] = {para_SpeedBias[WINDOW_SIZE][3], para_SpeedBias[WINDOW_SIZE][4],
++                            para_SpeedBias[WINDOW_SIZE][5]};
++    double _v_before[3]  = {para_SpeedBias[WINDOW_SIZE][0], para_SpeedBias[WINDOW_SIZE][1],
++                            para_SpeedBias[WINDOW_SIZE][2]};
      ceres::Solve(options, &problem, &summary);
++    {
++        static int _sn = 0;
++        if (++_sn % 25 == 1)
++            printf("  SOLVEDBG 迭代%2d 代价 %.4e -> %.4e | Ba %.6f->%.6f, %.6f->%.6f, %.6f->%.6f "
++                   "| V %.4f->%.4f | %s\n",
++                   (int)summary.iterations.size(), summary.initial_cost, summary.final_cost,
++                   _ba_before[0], para_SpeedBias[WINDOW_SIZE][3],
++                   _ba_before[1], para_SpeedBias[WINDOW_SIZE][4],
++                   _ba_before[2], para_SpeedBias[WINDOW_SIZE][5],
++                   _v_before[0], para_SpeedBias[WINDOW_SIZE][0],
++                   summary.termination_type == ceres::CONVERGENCE ? "收敛" : summary.message.c_str());
++    }
 +
 +    // 本地诊断: 优化器一旦不再更新状态，位置就会失控发散。实测多个版本里
 +    // Ba 都会在某一刻突然「一字不差地冻住」，随后位置在 2 分钟内从 0.3m
 +    // 涨到 2m。这里把 Ceres 自己的终止原因打出来，才能知道它到底是
 +    // 收敛了、还是因为代价非有限/线性求解失败之类的原因直接放弃了。
++    // 本地补丁：代价数值失控就自愈 —— 请求重新初始化。
++    //
++    // 实测「间歇性坏初始化」的判据极其干净(回放同一份数据，仅时序不同):
++    //     健康: 首次求解 代价 1.0e+07 -> 1.3e+03，之后稳定收敛
++    //     失效: 首次求解 代价 6.2e+42 -> 6.2e+42，一步不降
++    // 两者差 35 个数量级，不存在误判空间。
++    // 失效的成因是初始化期间的时序竞态导致某个 IMU 因子数值失效
++    // (实测该因子最大残差 3.5e21，而同一次求解里视觉残差只有 1.1e2)；
++    // Ceres 在这个量级上迭代 1 次就报"收敛"，所有状态原封不动，
++    // 污染随后写进边缘化先验，之后每帧都带着它 —— 位置纯 IMU 递推漂十几米。
++    //
++    // 这种状态【无法自行恢复】，只能重新初始化。阈值 1e12 远高于正常量级(1e7)、
++    // 又远低于失效量级(1e42)，取中间任意值都可以。
++    // 重置走的是 request_reset 标志(在 processMeasurements 解锁后执行)，
++    // 不能就地 clearState()，否则自死锁 —— 见本文件失效检测处的说明。
++    if (solver_flag == NON_LINEAR && std::isfinite(summary.final_cost) &&
++        summary.final_cost > 1e12)
++    {
++        ROS_WARN("优化代价数值失控 (%.3e)，初始化已被污染，请求重新初始化",
++                 summary.final_cost);
++        request_reset = true;
++    }
++    else if (!std::isfinite(summary.final_cost))
++    {
++        ROS_WARN("优化代价非有限，请求重新初始化");
++        request_reset = true;
++    }
++
 +    if (summary.termination_type != ceres::CONVERGENCE)
 +    {
 +        ROS_WARN("Ceres 未收敛: %s | 迭代 %d | 代价 %.6e -> %.6e",
@@ -439,6 +612,43 @@ index bf27b8c..c4d0b99 100755
 +    bool request_reset;
      bool initThreadFlag;
  };
+diff --git a/vins/src/estimator/feature_manager.cpp b/vins/src/estimator/feature_manager.cpp
+index d6022a4..1b3c277 100755
+--- a/vins/src/estimator/feature_manager.cpp
++++ b/vins/src/estimator/feature_manager.cpp
+@@ -334,7 +334,21 @@ void FeatureManager::triangulate(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vec
+             Eigen::Vector3d localPoint;
+             localPoint = leftPose.leftCols<3>() * point3d + leftPose.rightCols<1>();
+             double depth = localPoint.z();
+-            if (depth > 0)
++            // 本地补丁：深度必须有【上界】。
++            //
++            // 上游只判 depth > 0。但时间三角化用的是相邻两帧(imu_i 与 imu_i+1)，
++            // 相机静止时这两帧位姿几乎相同 -> 基线为零 -> 三角化退化 ->
++            // 深度可以是 1e10 甚至 1e20 的任意值。
++            // VINS 用逆深度参数化(para_Feature = 1/depth)，逆深度 ~1e-20 时
++            // 投影因子的残差会到 1e20 量级，代价冲到 1e40 以上。
++            // 此时 Ceres 只迭代 1 次就报"收敛"(在这个量级上任何一步的相对改善
++            // 都低于容差)，所有状态原封不动 —— 表现为 Ba/Bg 精确冻结、
++            // 位置纯 IMU 递推发散十几米。这就是一直没定位的「间歇性坏初始化」。
++            //
++            // 上界取 MAX_TRIANGULATE_DEPTH: 本机双目基线仅 4.6cm，fx=320，
++            // 100 米处视差只有 0.15 像素，远低于噪声，深度本就不可信。
++            // 超界的退回 INIT_DEPTH，与上游处理 depth<=0 的方式一致。
++            if (depth > MIN_TRIANGULATE_DEPTH && depth < MAX_TRIANGULATE_DEPTH)
+                 it_per_id.estimated_depth = depth;
+             else
+                 it_per_id.estimated_depth = INIT_DEPTH;
+@@ -369,7 +383,8 @@ void FeatureManager::triangulate(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vec
+             Eigen::Vector3d localPoint;
+             localPoint = leftPose.leftCols<3>() * point3d + leftPose.rightCols<1>();
+             double depth = localPoint.z();
+-            if (depth > 0)
++            // 同上：深度必须有上界，防止退化三角化产生天文数字深度。
++            if (depth > MIN_TRIANGULATE_DEPTH && depth < MAX_TRIANGULATE_DEPTH)
+                 it_per_id.estimated_depth = depth;
+             else
+                 it_per_id.estimated_depth = INIT_DEPTH;
 diff --git a/vins/src/estimator/parameters.cpp b/vins/src/estimator/parameters.cpp
 index 71afb67..df061f0 100755
 --- a/vins/src/estimator/parameters.cpp
@@ -535,10 +745,61 @@ index 0000000..215f223
 +    }
 +};
 diff --git a/vins/src/featureTracker/feature_tracker.cpp b/vins/src/featureTracker/feature_tracker.cpp
-index 3508bc0..356b58d 100755
+index 3508bc0..4943a5e 100755
 --- a/vins/src/featureTracker/feature_tracker.cpp
 +++ b/vins/src/featureTracker/feature_tracker.cpp
-@@ -605,7 +605,17 @@ vector<cv::Point2f> FeatureTracker::ptsVelocity(vector<int> &ids, vector<cv::Poi
+@@ -356,8 +356,32 @@ map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> FeatureTracker::trackIm
+             {
+                 TicToc t_check;
+                 vector<float> err;
++
++                // 本地补丁：给双目 LK 一个视差初值，而不是从零视差盲搜。
++                //
++                // 上游把 cur_right_pts 传空，等价于假设初始视差为 0，让 LK 自己搜。
++                // 但本项目的输入是【已矫正】双目(实测 dy 中位数 0.33 像素)，
++                // 视差几乎纯水平，且同一特征上一帧的视差就是极好的初值。
++                // 近处物体视差可达上百像素，远超 LK 的有效搜索范围
++                // (21x21 窗口 x 3 层金字塔)，零初值必然搜不到 —— 实测某场景里
++                // 90 个特征只有 30 个匹配成功(33%)，47 个死在反向校验。
++                // 而双目匹配数偏低又与「坏初始化」强相关(实测好的 44~58 个，
++                // 坏的只有 24~36 个)，因为深度约束不足会让尺度和零偏都定不下来。
++                //
++                // 这里用上一帧的同 id 视差做初值，配合 OPTFLOW_USE_INITIAL_FLOW。
++                // 没有历史的新特征退回零视差(与上游一致)，不会变差。
++                cur_right_pts.resize(cur_pts.size());
++                for (size_t i = 0; i < cur_pts.size(); i++)
++                {
++                    auto it = prev_disparity.find(ids[i]);
++                    const float d = (it != prev_disparity.end()) ? it->second : 0.0f;
++                    cur_right_pts[i] = cv::Point2f(cur_pts[i].x - d, cur_pts[i].y);
++                }
+                 // cur left ---- cur right
+-                cv::calcOpticalFlowPyrLK(cur_img, rightImg, cur_pts, cur_right_pts, status, err, cv::Size(21, 21), 3);
++                cv::calcOpticalFlowPyrLK(cur_img, rightImg, cur_pts, cur_right_pts, status, err,
++                                         cv::Size(21, 21), 3,
++                                         cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01),
++                                         cv::OPTFLOW_USE_INITIAL_FLOW);
+                 // reverse check cur right ---- cur left
+                 if(FLOW_BACK)
+                 {
+@@ -419,6 +443,16 @@ map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> FeatureTracker::trackIm
+                 // printf("gpu left right optical flow cost %fms\n",t_og1.toc());
+             }
+ #endif
++            // 本地补丁：把本帧匹配成功的视差存下来，作为下一帧 LK 的初值。
++            // 只存匹配成功的，失败的从缓存里删掉，避免用一个错误的视差反复误导。
++            for (size_t i = 0; i < status.size() && i < ids.size(); i++)
++            {
++                if (status[i])
++                    prev_disparity[ids[i]] = cur_pts[i].x - cur_right_pts[i].x;
++                else
++                    prev_disparity.erase(ids[i]);
++            }
++
+             ids_right = ids;
+             reduceVector(cur_right_pts, status);
+             reduceVector(ids_right, status);
+@@ -605,7 +639,17 @@ vector<cv::Point2f> FeatureTracker::ptsVelocity(vector<int> &ids, vector<cv::Poi
      }
  
      // caculate points velocity
@@ -557,3 +818,17 @@ index 3508bc0..356b58d 100755
      {
          double dt = cur_time - prev_time;
          
+diff --git a/vins/src/featureTracker/feature_tracker.h b/vins/src/featureTracker/feature_tracker.h
+index 7f4d8f5..0ec42dc 100755
+--- a/vins/src/featureTracker/feature_tracker.h
++++ b/vins/src/featureTracker/feature_tracker.h
+@@ -90,6 +90,9 @@ public:
+     vector<int> track_cnt;
+     map<int, cv::Point2f> cur_un_pts_map, prev_un_pts_map;
+     map<int, cv::Point2f> cur_un_right_pts_map, prev_un_right_pts_map;
++    // 本地补丁：每个特征上一帧的双目视差(左目x - 右目x)，用作下一帧 LK 的初值。
++    // 见 feature_tracker.cpp 里双目匹配处的说明。
++    map<int, float> prev_disparity;
+     map<int, cv::Point2f> prevLeftPtsMap;
+     vector<camodocal::CameraPtr> m_camera;
+     double cur_time;

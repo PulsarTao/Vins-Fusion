@@ -1,8 +1,8 @@
 diff --git a/vins/src/estimator/parameters.h b/vins/src/estimator/parameters.h
-index 34685c7..220c53b 100755
+index 34685c7..86e43d1 100755
 --- a/vins/src/estimator/parameters.h
 +++ b/vins/src/estimator/parameters.h
-@@ -29,8 +29,32 @@ const int WINDOW_SIZE = 10;
+@@ -29,8 +29,39 @@ const int WINDOW_SIZE = 10;
  const int NUM_OF_F = 1000;
  //#define UNIT_SPHERE_ERROR
  
@@ -22,6 +22,13 @@ index 34685c7..220c53b 100755
 +// 对运动工况无影响: 运动时每帧视差本就远超 keyframe_parallax(10px)，
 +// 自然走 MARGIN_OLD，这条分支根本不会触发。
 +const double MAX_KEYFRAME_INTERVAL = 0.15;
++
++// 本地补丁：三角化深度的有效区间(米)。上游只判 depth>0，没有上界 ——
++// 静止时相邻帧基线为零，三角化退化会产生 1e10~1e20 的深度，
++// 逆深度趋近 0 导致投影残差爆到 1e20、代价 1e40，优化器彻底停摆。
++// 详见 feature_manager.cpp triangulate() 里的说明。
++const double MIN_TRIANGULATE_DEPTH = 0.1;
++const double MAX_TRIANGULATE_DEPTH = 100.0;
 +
  extern double INIT_DEPTH;
  extern double MIN_PARALLAX;
