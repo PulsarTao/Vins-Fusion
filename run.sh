@@ -332,13 +332,38 @@ do_local_seeker() {
     docker cp "$HERE/config/fastdds_profile.xml" "$CONTAINER:/ros2_ws/vins_config/" >/dev/null 2>&1 || true
     docker cp "$HERE/config/vins_rviz2.rviz" "$CONTAINER:/ros2_ws/vins_config/" >/dev/null 2>&1 || true
 
-    info "启动 VINS-Fusion（矫正双目 + IMU）..."
-    docker exec -d -e FASTRTPS_DEFAULT_PROFILES_FILE=$DDS_PROFILE "$CONTAINER" \
-        /ros_entrypoint.sh bash -c \
-        "ros2 run vins vins_node /ros2_ws/vins_config/seeker/seeker_stereo_imu.yaml > /root/output/vins.log 2>&1"
-    sleep 12
-    docker exec "$CONTAINER" pgrep -f vins_node >/dev/null 2>&1 \
-        && ok "VINS 运行中" || warn "VINS 未启动，查看: ./run.sh logs vins"
+    # VINS 存在一个尚未定位的【间歇性坏初始化】: 同一份配置、同一个二进制，
+    # 有时会进入加速度计零偏不参与优化的状态(调试输出里 Ba 恒为 0.00000、
+    # solver 耗时明显偏低)，随后位置单方向发散且无法自行恢复。
+    # 根因未找到，这里用「自检 + 重试」绕过 —— 坏状态在启动十几秒内就能判定。
+    local vins_ok=false
+    for attempt in 1 2 3; do
+        info "启动 VINS-Fusion（矫正双目 + IMU）第 $attempt 次..."
+        docker exec "$CONTAINER" bash -c \
+            "ps -eo pid,args --no-headers | grep '[v]ins_node' | awk '{print \$1}' | xargs -r kill -9" \
+            >/dev/null 2>&1
+        sleep 2
+        docker exec -d -e FASTRTPS_DEFAULT_PROFILES_FILE=$DDS_PROFILE "$CONTAINER" \
+            /ros_entrypoint.sh bash -c \
+            "ros2 run vins vins_node /ros2_ws/vins_config/seeker/seeker_stereo_imu.yaml > /root/output/vins.log 2>&1"
+
+        local n=0
+        while [ $n -lt 60 ]; do
+            sleep 3; n=$((n+3))
+            [ "$(grep -c 'DBG V' "$HOME/vins_output/vins.log" 2>/dev/null || echo 0)" -gt 100 ] && break
+        done
+
+        # 健康判据: 加速度计零偏必须在被优化(取值有变化)。坏状态下它恒为 0.00000。
+        local uniq
+        uniq=$(grep 'DBG V' "$HOME/vins_output/vins.log" 2>/dev/null \
+               | sed 's/.*| Ba/Ba/;s/| Bg.*//' | sort -u | wc -l)
+        if [ "${uniq:-0}" -gt 3 ]; then
+            ok "VINS 运行中（零偏正常收敛，Ba 取值数 $uniq）"
+            vins_ok=true; break
+        fi
+        warn "第 $attempt 次落入坏初始化（Ba 恒定不变），重试"
+    done
+    $vins_ok || warn "3 次均落入坏初始化，请查看 ./run.sh logs vins"
 
     if $use_rviz; then
         info "启动 rviz2..."
