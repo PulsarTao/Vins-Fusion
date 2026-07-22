@@ -102,6 +102,17 @@ RUN . /opt/ros/humble/setup.sh && \
         --parallel-workers $(nproc) && \
     rm -rf build log
 
+# 回环检测(loop_fusion)要用的 DBoW2 词袋和 BRIEF 描述子模板。
+# pose_graph_node.cpp 里写死了从 <包的 share 目录>/../support_files/ 读:
+#     pkg_path = ament_index_cpp::get_package_share_directory("loop_fusion")
+#     vocabulary_file = pkg_path + "/../support_files/brief_k10L6.bin"
+# 但上游的 CMakeLists 没有任何 install 规则把 support_files 装到那里，
+# 于是编出来的镜像里这两个文件只存在于 src/ 下，loop_fusion 启动即找不到词袋。
+RUN mkdir -p $ROS2_WS/install/loop_fusion/share/support_files && \
+    cp $ROS2_WS/src/support_files/brief_k10L6.bin \
+       $ROS2_WS/src/support_files/brief_pattern.yml \
+       $ROS2_WS/install/loop_fusion/share/support_files/
+
 # 配置、launch、辅助脚本
 COPY config/ $ROS2_WS/vins_config/
 COPY launch/ $ROS2_WS/vins_launch/

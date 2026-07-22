@@ -323,6 +323,85 @@ gstd = g[:n*w].reshape(n, w, 3).std(axis=1).max(axis=1)
 moving = (astd > 0.06) | (gstd > 0.008)
 ```
 
+### 回环检测(loop_fusion)在这个 ROS2 移植里是死代码 —— 修好后漂移少 67 倍
+
+**这是本轮最大的发现。** 上游自带 `loop_fusion`（DBoW2 地点识别 + 4 自由度
+位姿图优化），词袋文件也在仓库里，但它从来没被启动过，而且**即使启动也收不到
+任何数据** —— 有三个独立问题叠在一起，症状全是「静默无输出」：
+
+**1) 订阅话题名带着 ROS1 的 `/vins_estimator/` 前缀（致命）**
+
+```cpp
+// 上游原文
+n->create_subscription<nav_msgs::msg::Odometry>("/vins_estimator/odometry", ...)
+```
+
+ROS1 里相对话题名按【节点名】解析，所以 `advertise("odometry")` 会变成
+`/vins_estimator/odometry`；但 **ROS2 里相对名按【命名空间】解析，节点名不参与**。
+vins 的 `create_publisher("odometry")` 实际发布在根命名空间 `/odometry`。
+实测 `ros2 topic list` 里只有 `/odometry` `/keyframe_pose` `/keyframe_point`
+`/extrinsic` `/margin_cloud`，没有任何 `/vins_estimator/*`。
+于是这几个订阅永远匹配不到发布者。
+
+**2) 图像订阅 QoS 不兼容**
+
+`loop_fusion` 用默认 QoS(RELIABLE)，而发布方（相机驱动、`ros2 bag play`）
+和 vins 自己的订阅（`rclcpp::SensorDataQoS()`）都是 BEST_EFFORT。
+RELIABLE 订阅者与 BEST_EFFORT 发布者 DDS 直接拒绝建连：
+
+```
+New publisher discovered on topic '/replay/cam0', offering incompatible QoS.
+No messages will be sent to it. Last incompatible policy: RELIABILITY
+```
+
+**3) 词袋文件没被 install 到代码里写死的路径**
+
+```cpp
+pkg_path = ament_index_cpp::get_package_share_directory("loop_fusion");
+vocabulary_file = pkg_path + "/../support_files/brief_k10L6.bin";
+```
+
+上游 CMakeLists 没有任何 install 规则把 `support_files/` 装到那里。
+已在 `docker/Dockerfile` 里补上拷贝步骤。
+
+前两个问题的修复见 `patches/0004`。
+
+**修好后的实测（307 秒静置完整回放）**
+
+| | 位移 | 折算 |
+|---|---|---|
+| VIO 本身（无回环校正） | 0.1138 m | 2.18 cm/分钟 |
+| **回环校正后** | **0.0017 m** | **≈ 0** |
+
+**少 67 倍**，静止漂移基本被消除。`run.sh local seeker` 现在会自动启动它，
+校正后的轨迹发布在 `odometry_rect`。
+
+排查这类「静默失效」的通用手法：节点起来了、日志无报错，不代表数据在流。
+先 `ros2 topic list` 核对话题名是否真的对得上（**不要相信源码里的字符串**），
+再看有没有 `incompatible QoS` 警告。
+
+### Ba 软先验：一个诚实的否定结果
+
+诊断出静止时 Ba 单调增长（5 分钟涨到 1.25 m/s²，是标定出的随机游走
+所允许量的 30 倍），据此加了软先验把它锚回进入静止时的值
+（`factor/acc_bias_prior_factor.h`，sigma=0.05）。
+
+先验确实咬住了 —— Ba 增长率从 0.42/千帧降到 0.036/千帧，**慢了 12 倍**：
+
+| 帧 | 无先验 \|Ba\| | 有先验 \|Ba\| |
+|---|---|---|
+| 301 | 0.347 | 0.019 |
+| 1501 | 0.792 | 0.411 |
+| 3001 | 1.252 | 0.639 |
+
+**但位置漂移只从 2.55 改善到 2.24 cm/分钟（约 12%）。**
+也就是说 **Ba 漂移是伴随现象，不是位置漂移的主因**，原诊断方向不对。
+这一项保留（物理上正确、无副作用），但它不是解决漂移的那把钥匙 ——
+真正的钥匙是上面的回环检测。
+
+教训：某个量「明显不对」不等于它就是病因。改动之后要看**目标指标**动没动，
+不能只看被改的那个量动没动。
+
 ### 尚未解决 / 需要注意
 
 **长时间静止仍可能触发单帧突变。** 静止是 VIO 的**退化构型**：

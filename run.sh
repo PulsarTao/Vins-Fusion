@@ -159,7 +159,7 @@ stop_all() {
     docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER" && \
       docker exec "$CONTAINER" bash -c '
         ps -eo pid,args --no-headers \
-          | grep -E "[v]ins_node|[r]viz2|[r]ealsense2_camera|[d]435i_publisher" \
+          | grep -E "[v]ins_node|[l]oop_fusion_node|[r]viz2|[r]ealsense2_camera|[d]435i_publisher" \
           | awk "{print \$1}" | while read p; do kill -9 $p 2>/dev/null; done
         exit 0' >/dev/null 2>&1
 
@@ -183,7 +183,7 @@ show_status() {
         local c; c=$(ps -eo args --no-headers 2>/dev/null | grep -cF "$n" || true)
         [ "${c:-0}" -gt 0 ] && echo -e "  ${C_G}✓${C_N} $n" || echo -e "  ${C_Y}-${C_N} $n"
     done
-    for n in vins_node rviz2; do
+    for n in vins_node loop_fusion_node rviz2; do
         if docker exec "$CONTAINER" pgrep -f "$n" >/dev/null 2>&1; then
             echo -e "  ${C_G}✓${C_N} $n (容器内)"
         else
@@ -369,6 +369,30 @@ do_local_seeker() {
     done
     $vins_ok || warn "3 次均落入坏初始化，请查看 ./run.sh logs vins"
 
+    # 回环检测 + 4 自由度位姿图优化。
+    # 这是消除漂移的关键一环: 实测 307 秒静置，VIO 本身漂 11.4cm(2.2cm/分钟)，
+    # 加上回环校正后只剩 1.7mm —— 差 67 倍。走一圈回原点的场景收益更大。
+    # 上游这个模块在 ROS2 移植里是【死代码】(话题名和 QoS 两个 bug，见 patches/0004)，
+    # 必须打完补丁才有用。
+    info "启动 loop_fusion（回环检测）..."
+    docker exec "$CONTAINER" bash -c \
+        "ps -eo pid,args --no-headers | grep '[l]oop_fusion_node' | awk '{print \$1}' | xargs -r kill -9" \
+        >/dev/null 2>&1
+    docker exec -d -e FASTRTPS_DEFAULT_PROFILES_FILE=$DDS_PROFILE "$CONTAINER" \
+        /ros_entrypoint.sh bash -c \
+        "ros2 run loop_fusion loop_fusion_node /ros2_ws/vins_config/seeker/seeker_stereo_imu.yaml > /root/output/loop.log 2>&1"
+    # 词袋 60MB，加载要十几秒；加载完会打印 "no previous pose graph"
+    local ln=0
+    while [ $ln -lt 40 ]; do
+        sleep 2; ln=$((ln+2))
+        grep -q "pose graph optimization" "$HOME/vins_output/loop.log" 2>/dev/null && break
+    done
+    if grep -q "pose graph optimization" "$HOME/vins_output/loop.log" 2>/dev/null; then
+        ok "loop_fusion 已就绪（回环校正后的轨迹发布在 /pose_graph_path 与 odometry_rect）"
+    else
+        warn "loop_fusion 未就绪，请查看 ./run.sh logs loop"
+    fi
+
     if $use_rviz; then
         info "启动 rviz2..."
         docker exec -d -e DISPLAY="${DISPLAY:-:0}" -e FASTRTPS_DEFAULT_PROFILES_FILE=$DDS_PROFILE \
@@ -386,7 +410,8 @@ do_local_seeker() {
     echo
     echo "  相机: front 矫正双目(物理鱼眼 left+right，基线 4.6cm) + IMU"
     echo "        鱼眼已去畸变为 640x480 针孔，视场 90°x74°"
-    echo "  状态: ./run.sh status   日志: ./run.sh logs vins   停止: ./run.sh stop"
+    echo "  回环: 已启用（静置 5 分钟漂移 11.4cm -> 1.7mm）"
+  echo "  状态: ./run.sh status   日志: ./run.sh logs vins / logs loop   停止: ./run.sh stop"
     echo "────────────────────────────────────────────────────────"
 }
 
@@ -444,7 +469,8 @@ show_logs() {
         bridge) tail -40 "$LOG/bridge.log" 2>/dev/null ;;
         vins)   docker exec "$CONTAINER" tail -40 /root/output/vins.log 2>/dev/null ;;
         rviz)   docker exec "$CONTAINER" tail -40 /root/output/rviz.log 2>/dev/null ;;
-        *)      err "未知日志: $1 (可选 gz|px4|bridge|vins|rviz)"; exit 1 ;;
+        loop)   docker exec "$CONTAINER" tail -40 /root/output/loop.log 2>/dev/null ;;
+        *)      err "未知日志: $1 (可选 gz|px4|bridge|vins|rviz|loop)"; exit 1 ;;
     esac
 }
 

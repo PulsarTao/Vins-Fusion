@@ -1,5 +1,5 @@
 diff --git a/vins/src/estimator/estimator.cpp b/vins/src/estimator/estimator.cpp
-index ac014af..8a95102 100755
+index ac014af..5637ce1 100755
 --- a/vins/src/estimator/estimator.cpp
 +++ b/vins/src/estimator/estimator.cpp
 @@ -29,12 +29,26 @@ Estimator::~Estimator()
@@ -29,12 +29,13 @@ index ac014af..8a95102 100755
  
      prevTime = -1;
      curTime = 0;
-@@ -43,6 +57,22 @@ void Estimator::clearState()
+@@ -43,6 +57,23 @@ void Estimator::clearState()
      initR = Eigen::Matrix3d::Identity();
      inputImageCnt = 0;
      initFirstPoseFlag = false;
 +    is_static = false;
 +    static_count = 0;
++    ba_static_ref.setZero();
 +    no_vision_cnt = 0;
 +    request_reset = false;
 +
@@ -52,7 +53,7 @@ index ac014af..8a95102 100755
  
      for (int i = 0; i < WINDOW_SIZE + 1; i++)
      {
-@@ -233,6 +263,78 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
+@@ -233,6 +264,82 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
  }
  
  
@@ -122,7 +123,11 @@ index ac014af..8a95102 100755
 +        if (!is_static && static_count >= HOLD_N)
 +        {
 +            is_static = true;
-+            ROS_INFO("ZUPT: 检测到静止，启用零速修正");
++            // 快照当前 Ba 作为静止期间 Ba 软先验的锚点
++            // (见 factor/acc_bias_prior_factor.h)
++            ba_static_ref = Bas[frame_count];
++            ROS_INFO("ZUPT: 检测到静止，启用零速修正 (Ba 锚点 %.5f %.5f %.5f)",
++                     ba_static_ref.x(), ba_static_ref.y(), ba_static_ref.z());
 +        }
 +    }
 +    return is_static;
@@ -131,7 +136,7 @@ index ac014af..8a95102 100755
  bool Estimator::getIMUInterval(double t0, double t1, vector<pair<double, Eigen::Vector3d>> &accVector, 
                                  vector<pair<double, Eigen::Vector3d>> &gyrVector)
  {
-@@ -314,6 +416,8 @@ void Estimator::processMeasurements()
+@@ -314,6 +421,8 @@ void Estimator::processMeasurements()
              {
                  // cout << "2-1)" << endl;
                  getIMUInterval(prevTime, curTime, accVector, gyrVector);
@@ -140,7 +145,7 @@ index ac014af..8a95102 100755
                  // cout << "2-2)" << endl;
              }
  
-@@ -369,6 +473,16 @@ void Estimator::processMeasurements()
+@@ -369,6 +478,16 @@ void Estimator::processMeasurements()
              // cout << "5-6" << endl;
              mProcess.unlock();
  
@@ -157,7 +162,7 @@ index ac014af..8a95102 100755
  
              // cout << "6" << endl;
  
-@@ -398,6 +512,33 @@ void Estimator::initFirstIMUPose(vector<pair<double, Eigen::Vector3d>> &accVecto
+@@ -398,6 +517,33 @@ void Estimator::initFirstIMUPose(vector<pair<double, Eigen::Vector3d>> &accVecto
      }
      averAcc = averAcc / n;
      printf("averge acc %f %f %f\n", averAcc.x(), averAcc.y(), averAcc.z());
@@ -191,7 +196,7 @@ index ac014af..8a95102 100755
      Matrix3d R0 = Utility::g2R(averAcc);
      double yaw = Utility::R2ypr(R0).x();
      R0 = Utility::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0;
-@@ -444,6 +585,9 @@ void Estimator::processIMU(double t, double dt, const Vector3d &linear_accelerat
+@@ -444,6 +590,9 @@ void Estimator::processIMU(double t, double dt, const Vector3d &linear_accelerat
          Rs[j] *= Utility::deltaQ(un_gyr * dt).toRotationMatrix();
          Vector3d un_acc_1 = Rs[j] * (linear_acceleration - Bas[j]) - g;
          Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);
@@ -201,7 +206,7 @@ index ac014af..8a95102 100755
          Ps[j] += dt * Vs[j] + 0.5 * dt * dt * un_acc;
          Vs[j] += dt * un_acc;
      }
-@@ -470,6 +614,43 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
+@@ -470,6 +619,43 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
          //printf("non-keyframe\n");
      }
  
@@ -245,7 +250,7 @@ index ac014af..8a95102 100755
      ROS_DEBUG("%s", marginalization_flag ? "Non-keyframe" : "Keyframe");
      ROS_DEBUG("Solving %d", frame_count);
      ROS_DEBUG("number of feature: %d", f_manager.getFeatureCount());
-@@ -607,9 +788,24 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
+@@ -607,9 +793,24 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
          {
              ROS_WARN("failure detection!");
              failure_occur = 1;
@@ -273,7 +278,7 @@ index ac014af..8a95102 100755
              return;
          }
  
-@@ -1008,20 +1204,80 @@ void Estimator::double2vector()
+@@ -1008,20 +1209,80 @@ void Estimator::double2vector()
  
  bool Estimator::failureDetection()
  {
@@ -360,7 +365,7 @@ index ac014af..8a95102 100755
          return true;
      }
      /*
-@@ -1060,6 +1316,18 @@ void Estimator::optimization()
+@@ -1060,6 +1321,18 @@ void Estimator::optimization()
      TicToc t_whole, t_prepare;
      vector2double();
  
@@ -379,7 +384,7 @@ index ac014af..8a95102 100755
      ceres::Problem problem;
      ceres::LossFunction *loss_function;
      //loss_function = NULL;
-@@ -1071,7 +1339,37 @@ void Estimator::optimization()
+@@ -1071,7 +1344,45 @@ void Estimator::optimization()
          ceres::Manifold *local_parameterization = new PoseLocalParameterization();
          problem.AddParameterBlock(para_Pose[i], SIZE_POSE, local_parameterization);
          if(USE_IMU)
@@ -406,10 +411,18 @@ index ac014af..8a95102 100755
 +                // 对应重力方向偏差 2.3° —— 静止时加速度计零偏与俯仰/横滚
 +                // 完全耦合(同一测量既可解释成"有零偏"也可解释成"倾斜了")，
 +                // 优化器无从区分，两者一起漂，位置随之线性爬行。
-+                // 但正确的处理是给 Ba 加软先验而非硬冻结，这一项尚未实现。
++                // 正确的处理是给 Ba 加【软先验】—— 就在下面几行，
++                // 锚点是进入静止那一刻的 Ba 值，详见 factor/acc_bias_prior_factor.h。
 +                static const std::vector<int> kFixedVel{0, 1, 2};
 +                problem.AddParameterBlock(para_SpeedBias[i], SIZE_SPEEDBIAS,
 +                                          new ceres::SubsetManifold(SIZE_SPEEDBIAS, kFixedVel));
++
++                // Ba 软先验: 静止时零偏与俯仰/横滚完全耦合，没有任何观测能把
++                // 两者分开，Ba 会一路单调游走(实测 5 分钟涨到 0.4~0.95 m/s²，
++                // 是标定出的随机游走所允许量的 30 倍)。这里把它软锚回进入静止
++                // 时的值 —— 不禁止零偏非零(真实零偏本来就非零)，只禁止持续增长。
++                problem.AddResidualBlock(new AccBiasPriorFactor(ba_static_ref), NULL,
++                                         para_SpeedBias[i]);
 +            }
 +            else
 +                problem.AddParameterBlock(para_SpeedBias[i], SIZE_SPEEDBIAS);
@@ -418,7 +431,7 @@ index ac014af..8a95102 100755
      }
      if(!USE_IMU)
          problem.SetParameterBlockConstant(para_Pose[0]);
-@@ -1100,18 +1398,48 @@ void Estimator::optimization()
+@@ -1100,18 +1411,48 @@ void Estimator::optimization()
      {
          // construct new marginlization_factor
          MarginalizationFactor *marginalization_factor = new MarginalizationFactor(last_marginalization_info);
@@ -471,7 +484,7 @@ index ac014af..8a95102 100755
          }
      }
  
-@@ -1137,7 +1465,7 @@ void Estimator::optimization()
+@@ -1137,7 +1478,7 @@ void Estimator::optimization()
                  Vector3d pts_j = it_per_frame.point;
                  ProjectionTwoFrameOneCamFactor *f_td = new ProjectionTwoFrameOneCamFactor(pts_i, pts_j, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocity,
                                                                   it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
@@ -480,7 +493,7 @@ index ac014af..8a95102 100755
              }
  
              if(STEREO && it_per_frame.is_stereo)
-@@ -1147,18 +1475,37 @@ void Estimator::optimization()
+@@ -1147,18 +1488,37 @@ void Estimator::optimization()
                  {
                      ProjectionTwoFrameTwoCamFactor *f = new ProjectionTwoFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
                                                                   it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
@@ -520,7 +533,7 @@ index ac014af..8a95102 100755
      }
  
      ROS_DEBUG("visual measurement count: %d", f_m_cnt);
-@@ -1185,9 +1532,111 @@ void Estimator::optimization()
+@@ -1185,9 +1545,111 @@ void Estimator::optimization()
          options.max_solver_time_in_seconds = SOLVER_TIME * 4.0 / 5.0;
      else
          options.max_solver_time_in_seconds = SOLVER_TIME;
@@ -633,18 +646,19 @@ index ac014af..8a95102 100755
      ROS_DEBUG("Iterations : %d", static_cast<int>(summary.iterations.size()));
      //printf("solver costs: %f \n", t_solver.toc());
 diff --git a/vins/src/estimator/estimator.h b/vins/src/estimator/estimator.h
-index bf27b8c..c4d0b99 100755
+index bf27b8c..278c683 100755
 --- a/vins/src/estimator/estimator.h
 +++ b/vins/src/estimator/estimator.h
-@@ -34,6 +34,7 @@
+@@ -34,6 +34,8 @@
  #include "../factor/projectionTwoFrameOneCamFactor.h"
  #include "../factor/projectionTwoFrameTwoCamFactor.h"
  #include "../factor/projectionOneFrameTwoCamFactor.h"
 +#include "../factor/zero_motion_factor.h"
++#include "../factor/acc_bias_prior_factor.h"
  #include "../featureTracker/feature_tracker.h"
  
  #define ROS_INFO RCUTILS_LOG_INFO
-@@ -177,5 +178,18 @@ class Estimator
+@@ -177,5 +179,22 @@ class Estimator
      Eigen::Quaterniond latest_Q;
  
      bool initFirstPoseFlag;
@@ -655,6 +669,10 @@ index bf27b8c..c4d0b99 100755
 +    bool detectStatic(const std::vector<std::pair<double, Eigen::Vector3d>> &accVector,
 +                      const std::vector<std::pair<double, Eigen::Vector3d>> &gyrVector);
 +    bool is_static;          // 当前是否判定为静止
++    // 进入静止那一刻的加速度计零偏，作为静止期间 Ba 软先验的锚点。
++    // 锚到「进入静止时已收敛到的值」而不是 0 —— 真实零偏本来就可能非零，
++    // 要压的是其后的持续增长。详见 factor/acc_bias_prior_factor.h。
++    Eigen::Vector3d ba_static_ref;
 +    int  static_count;       // 连续判定为静止的区间数(用于迟滞)
 +    int  no_vision_cnt;      // 连续多少帧没有可用视觉约束(失效检测用)
 +    // 失效检测请求重置。实际的 clearState()/setParameter() 必须放到
@@ -724,6 +742,75 @@ index 71afb67..df061f0 100755
      MIN_PARALLAX = fsSettings["keyframe_parallax"];
      MIN_PARALLAX = MIN_PARALLAX / FOCAL_LENGTH;
  
+diff --git a/vins/src/factor/acc_bias_prior_factor.h b/vins/src/factor/acc_bias_prior_factor.h
+new file mode 100644
+index 0000000..bef3443
+--- /dev/null
++++ b/vins/src/factor/acc_bias_prior_factor.h
+@@ -0,0 +1,63 @@
++/*******************************************************
++ * 加速度计零偏软先验 —— 本项目新增，非上游文件
++ *
++ * 静止时把 Ba 软锚定到「刚进入静止状态那一刻的值」:
++ *     residual = (Ba - Ba_ref) / sigma
++ *
++ * 要解决的问题:
++ *   静止时加速度计零偏与俯仰/横滚【完全耦合】—— 同一个比力读数
++ *   既可以解释成「有零偏」也可以解释成「传感器倾斜了」，优化器无从区分。
++ *   实测静置 5 分钟 Ba 单调涨到 0.4~0.95 m/s²，远超标定出的零偏随机游走
++ *   所允许的量级(acc_w=0.0017 m/s²/√s，300 秒自由游走才 0.03)，
++ *   对应重力方向偏差 2.3°，位置随之线性爬行。
++ *
++ * 为什么不能硬冻结(实测走过的弯路，代价惨重):
++ *   把 Ba 用 SubsetManifold 冻死(索引 3..5)之后，实测 117 帧就发散到 1e84 米。
++ *   Ba 是 IMU 残差里必需的自由度，冻死它之后残差无论如何都满足不了，
++ *   优化器直接爆炸。
++ *
++ * 为什么锚到 Ba_ref 而不是锚到 0:
++ *   廉价 MEMS 的真实零偏本来就可能有零点几 m/s²，锚到 0 是把物理事实当误差。
++ *   要压的是「持续单调增长」，不是「零偏非零」。所以锚到进入静止时它已经
++ *   收敛到的值，只禁止其后继续漂。
++ *
++ * sigma 取值依据:
++ *   标定出的零偏随机游走 acc_w = 0.0017 m/s²/√s，静置 300 秒的物理游走量
++ *   约 0.0017*sqrt(300) = 0.029 m/s²。先验加在窗口内全部 11 个 SpeedBias 块上，
++ *   等效 sigma = SIGMA/sqrt(11)。取 SIGMA=0.05 -> 等效 0.015 m/s²，
++ *   与物理允许量同量级 —— 不跟物理较劲，只掐掉超出物理 30 倍的那部分漂移。
++ *
++ * 参数块是 para_SpeedBias，布局 [V(0..2), Ba(3..5), Bg(6..8)]，只约束 Ba。
++ *******************************************************/
++
++#pragma once
++
++#include <ceres/ceres.h>
++#include <eigen3/Eigen/Dense>
++
++class AccBiasPriorFactor : public ceres::SizedCostFunction<3, 9>
++{
++  public:
++    static constexpr double SIGMA = 0.05;
++
++    explicit AccBiasPriorFactor(const Eigen::Vector3d &ba_ref) : ba_ref_(ba_ref) {}
++
++    virtual bool Evaluate(double const *const *parameters, double *residuals,
++                          double **jacobians) const
++    {
++        const double w = 1.0 / SIGMA;
++        for (int k = 0; k < 3; ++k)
++            residuals[k] = w * (parameters[0][3 + k] - ba_ref_(k));
++
++        if (jacobians && jacobians[0])
++        {
++            Eigen::Map<Eigen::Matrix<double, 3, 9, Eigen::RowMajor>> J(jacobians[0]);
++            J.setZero();
++            J.block<3, 3>(0, 3) = w * Eigen::Matrix3d::Identity();
++        }
++        return true;
++    }
++
++  private:
++    Eigen::Vector3d ba_ref_;
++};
 diff --git a/vins/src/factor/zero_motion_factor.h b/vins/src/factor/zero_motion_factor.h
 new file mode 100644
 index 0000000..f6e2921

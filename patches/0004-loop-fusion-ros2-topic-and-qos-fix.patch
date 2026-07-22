@@ -1,0 +1,46 @@
+diff --git a/loop_fusion/src/pose_graph_node.cpp b/loop_fusion/src/pose_graph_node.cpp
+index 8bc5832..2554ab3 100755
+--- a/loop_fusion/src/pose_graph_node.cpp
++++ b/loop_fusion/src/pose_graph_node.cpp
+@@ -502,12 +502,35 @@ int main(int argc, char **argv)
+         load_flag = 1;
+     }
+ 
+-    auto sub_vio          = n->create_subscription<nav_msgs::msg::Odometry>("/vins_estimator/odometry", rclcpp::QoS(rclcpp::KeepLast(2000)), vio_callback);
+-    auto sub_image        = n->create_subscription<sensor_msgs::msg::Image>(IMAGE_TOPIC, rclcpp::QoS(rclcpp::KeepLast(2000)), image_callback);
+-    auto sub_pose         = n->create_subscription<nav_msgs::msg::Odometry>("/vins_estimator/keyframe_pose", rclcpp::QoS(rclcpp::KeepLast(2000)), pose_callback);
+-    auto sub_extrinsic    = n->create_subscription<nav_msgs::msg::Odometry>("/vins_estimator/extrinsic", rclcpp::QoS(rclcpp::KeepLast(2000)), extrinsic_callback);
+-    auto sub_point        = n->create_subscription<sensor_msgs::msg::PointCloud>("/vins_estimator/keyframe_point", rclcpp::QoS(rclcpp::KeepLast(2000)), point_callback);
+-    auto sub_margin_point = n->create_subscription<sensor_msgs::msg::PointCloud>("/vins_estimator/margin_cloud", rclcpp::QoS(rclcpp::KeepLast(2000)), margin_point_callback);
++    // 本地补丁：去掉订阅话题名里的 "/vins_estimator/" 前缀。
++    //
++    // 这是上游 ROS2 移植遗留的 ROS1 习惯。ROS1 里相对话题名按【节点名】解析，
++    // 所以 vins_estimator 节点里 advertise("odometry") 会变成
++    // /vins_estimator/odometry；但 ROS2 里相对名按【命名空间】解析，
++    // 节点名不参与 —— vins 的 create_publisher("odometry") 实际发布在
++    // 根命名空间 /odometry。实测 ros2 topic list 里只有
++    // /odometry /keyframe_pose /keyframe_point /extrinsic /margin_cloud，
++    // 没有任何 /vins_estimator/* 。
++    //
++    // 后果: loop_fusion 的这几个订阅【永远匹配不到任何发布者】，
++    // 节点正常启动、词袋正常加载、无任何报错，但一条消息都收不到 ——
++    // 回环检测在这个移植里从来就是死代码。加上原本图像订阅的 QoS 也不兼容
++    // (见下面 sub_image 的说明)，两个问题叠在一起，症状是完全静默。
++    auto sub_vio          = n->create_subscription<nav_msgs::msg::Odometry>("/odometry", rclcpp::QoS(rclcpp::KeepLast(2000)), vio_callback);
++    // 本地补丁：图像订阅必须用 SensorDataQoS(BEST_EFFORT)。
++    // 上游 ROS2 移植在这里用了默认 QoS(RELIABLE)，而同一份数据的发布方
++    // (相机驱动、ros2 bag play)和 vins_node 的订阅(rosNodeTest.cpp 里
++    // 用的是 rclcpp::SensorDataQoS())都是 BEST_EFFORT ——
++    // RELIABLE 订阅者与 BEST_EFFORT 发布者 QoS 不兼容，DDS 直接拒绝建立连接:
++    //   "New publisher discovered on topic '...', offering incompatible QoS.
++    //    No messages will be sent to it. Last incompatible policy: RELIABILITY"
++    // 后果是 loop_fusion 一帧图像都收不到，回环检测静默失效 ——
++    // 节点正常启动、词袋正常加载、日志无任何报错，只是永远检测不到回环。
++    auto sub_image        = n->create_subscription<sensor_msgs::msg::Image>(IMAGE_TOPIC, rclcpp::SensorDataQoS().keep_last(2000), image_callback);
++    auto sub_pose         = n->create_subscription<nav_msgs::msg::Odometry>("/keyframe_pose", rclcpp::QoS(rclcpp::KeepLast(2000)), pose_callback);
++    auto sub_extrinsic    = n->create_subscription<nav_msgs::msg::Odometry>("/extrinsic", rclcpp::QoS(rclcpp::KeepLast(2000)), extrinsic_callback);
++    auto sub_point        = n->create_subscription<sensor_msgs::msg::PointCloud>("/keyframe_point", rclcpp::QoS(rclcpp::KeepLast(2000)), point_callback);
++    auto sub_margin_point = n->create_subscription<sensor_msgs::msg::PointCloud>("/margin_cloud", rclcpp::QoS(rclcpp::KeepLast(2000)), margin_point_callback);
+ 
+ 
+     pub_match_img          = n->create_publisher<sensor_msgs::msg::Image>("match_image", 1000);
