@@ -24,6 +24,9 @@ acceleration.png
 gyro.png
 imu.yaml
 
+# 回放专用配置（由 scripts/make_replay_config.sh 生成）
+config/seeker/_rp.yaml
+
 # 运行时输出
 *.log
 output/

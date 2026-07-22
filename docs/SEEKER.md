@@ -284,6 +284,45 @@ for (size_t i = 0; i < calib_file.size(); i++)
 `reading paramerter` 恒为 2 说明 `m_camera` 不再增长。
 漂移数值与修复前的已知良好基线（2.3 cm/分钟）一致，确认修复没有引入回归。
 
+### 回放测试用的配置必须能从版本控制重建
+
+回放时要把 VINS 订阅的话题改到 `/replay/*`，否则实时驱动如果还开着，
+两路数据会同时进 VINS、时间戳互相穿插，表现为大量重复/回退时间戳，
+排查时极难看出是数据源的问题。
+
+这份 `_rp.yaml` 早前是手工在容器里改出来的 —— 容器一重建就丢，
+于是出现「同一条命令昨天能跑今天报 `config_file dosen't exist`」。
+现在由 `scripts/make_replay_config.sh` 生成：
+
+```bash
+./scripts/make_replay_config.sh
+ros2 bag play <bag> --remap /imu_data_raw:=/replay/imu \
+    /cam0/image_raw:=/replay/cam0 /cam1/image_raw:=/replay/cam1
+```
+
+教训是通用的：凡是跑测试要用的东西都必须能从版本控制里重建，
+手工改在容器里的东西一律视为已经丢了。
+
+### 已录的两份「运动」数据其实全程静止
+
+`~/vins_bags/motion/run1`(53 秒) 和 `run2`(17.6 分钟, 19 GB) 都是为闭环误差
+测试录的，但按 1 秒窗口的 IMU 标准差判定（阈值 `acc>0.06` 或 `gyro>0.008`）：
+
+* run1: 53 秒**全部**判定为静止
+* run2: 1062 秒里只有 **3 秒**有运动，且没有任何 ≥3 秒的连续运动段
+
+所以**运动精度至今没有任何数据**，闭环误差测试仍然待做，必须实际走一圈。
+两份 bag 录制时都被强杀，缺 `metadata.yaml`，需先 `ros2 bag reindex <目录>` 才能回放。
+
+判定脚本的核心（不要用原始读数设阈值，陀螺静止时读数就是零偏、
+加速度计静止时读数是重力，都不为零）：
+
+```python
+astd = a[:n*w].reshape(n, w, 3).std(axis=1).max(axis=1)   # 1 秒窗内的标准差
+gstd = g[:n*w].reshape(n, w, 3).std(axis=1).max(axis=1)
+moving = (astd > 0.06) | (gstd > 0.008)
+```
+
 ### 尚未解决 / 需要注意
 
 **长时间静止仍可能触发单帧突变。** 静止是 VIO 的**退化构型**：
