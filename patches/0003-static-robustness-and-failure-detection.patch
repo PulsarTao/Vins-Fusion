@@ -1,8 +1,35 @@
 diff --git a/vins/src/estimator/estimator.cpp b/vins/src/estimator/estimator.cpp
-index ac014af..9ac3577 100755
+index ac014af..8a95102 100755
 --- a/vins/src/estimator/estimator.cpp
 +++ b/vins/src/estimator/estimator.cpp
-@@ -43,6 +43,22 @@ void Estimator::clearState()
+@@ -29,12 +29,26 @@ Estimator::~Estimator()
+ void Estimator::clearState()
+ {
+     mProcess.lock();
++
++    // 本地补丁：清空这三个队列必须持 mBuf 锁。
++    //
++    // 上游这里只持 mProcess，但 accBuf/gyrBuf/featureBuf 是由
++    // inputIMU()/inputImage()/inputFeature() 在【其他线程】持 mBuf 锁写入的。
++    // 两把不同的锁保护同一份数据 = 数据竞争，实测表现为 clearState() 之后
++    // vins_node 段错误(Segmentation fault)。
++    //
++    // 上游没暴露这个问题，是因为 failureDetection() 被 return false 废掉了，
++    // clearState() 在运行时根本不会被调用(只在构造和 changeSensorType 时调，
++    // 那两个场景没有并发写入)。本项目恢复了失效检测与代价失控自愈，
++    // clearState() 变成运行时热路径，这个竞争就必须修。
++    mBuf.lock();
+     while(!accBuf.empty())
+         accBuf.pop();
+     while(!gyrBuf.empty())
+         gyrBuf.pop();
+     while(!featureBuf.empty())
+         featureBuf.pop();
++    mBuf.unlock();
+ 
+     prevTime = -1;
+     curTime = 0;
+@@ -43,6 +57,22 @@ void Estimator::clearState()
      initR = Eigen::Matrix3d::Identity();
      inputImageCnt = 0;
      initFirstPoseFlag = false;
@@ -25,7 +52,7 @@ index ac014af..9ac3577 100755
  
      for (int i = 0; i < WINDOW_SIZE + 1; i++)
      {
-@@ -233,6 +249,78 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
+@@ -233,6 +263,78 @@ void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Ma
  }
  
  
@@ -104,7 +131,7 @@ index ac014af..9ac3577 100755
  bool Estimator::getIMUInterval(double t0, double t1, vector<pair<double, Eigen::Vector3d>> &accVector, 
                                  vector<pair<double, Eigen::Vector3d>> &gyrVector)
  {
-@@ -314,6 +402,8 @@ void Estimator::processMeasurements()
+@@ -314,6 +416,8 @@ void Estimator::processMeasurements()
              {
                  // cout << "2-1)" << endl;
                  getIMUInterval(prevTime, curTime, accVector, gyrVector);
@@ -113,7 +140,7 @@ index ac014af..9ac3577 100755
                  // cout << "2-2)" << endl;
              }
  
-@@ -369,6 +459,16 @@ void Estimator::processMeasurements()
+@@ -369,6 +473,16 @@ void Estimator::processMeasurements()
              // cout << "5-6" << endl;
              mProcess.unlock();
  
@@ -130,7 +157,7 @@ index ac014af..9ac3577 100755
  
              // cout << "6" << endl;
  
-@@ -398,6 +498,33 @@ void Estimator::initFirstIMUPose(vector<pair<double, Eigen::Vector3d>> &accVecto
+@@ -398,6 +512,33 @@ void Estimator::initFirstIMUPose(vector<pair<double, Eigen::Vector3d>> &accVecto
      }
      averAcc = averAcc / n;
      printf("averge acc %f %f %f\n", averAcc.x(), averAcc.y(), averAcc.z());
@@ -164,7 +191,17 @@ index ac014af..9ac3577 100755
      Matrix3d R0 = Utility::g2R(averAcc);
      double yaw = Utility::R2ypr(R0).x();
      R0 = Utility::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0;
-@@ -470,6 +597,43 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
+@@ -444,6 +585,9 @@ void Estimator::processIMU(double t, double dt, const Vector3d &linear_accelerat
+         Rs[j] *= Utility::deltaQ(un_gyr * dt).toRotationMatrix();
+         Vector3d un_acc_1 = Rs[j] * (linear_acceleration - Bas[j]) - g;
+         Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);
++
++        // 注: 试过静止时跳过这两行(不注入死递推误差)，实测无改善 ——
++        // 优化器本来就会覆盖初值，问题不在初值。
+         Ps[j] += dt * Vs[j] + 0.5 * dt * dt * un_acc;
+         Vs[j] += dt * un_acc;
+     }
+@@ -470,6 +614,43 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
          //printf("non-keyframe\n");
      }
  
@@ -208,7 +245,7 @@ index ac014af..9ac3577 100755
      ROS_DEBUG("%s", marginalization_flag ? "Non-keyframe" : "Keyframe");
      ROS_DEBUG("Solving %d", frame_count);
      ROS_DEBUG("number of feature: %d", f_manager.getFeatureCount());
-@@ -607,9 +771,24 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
+@@ -607,9 +788,24 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
          {
              ROS_WARN("failure detection!");
              failure_occur = 1;
@@ -236,7 +273,7 @@ index ac014af..9ac3577 100755
              return;
          }
  
-@@ -1008,20 +1187,80 @@ void Estimator::double2vector()
+@@ -1008,20 +1204,80 @@ void Estimator::double2vector()
  
  bool Estimator::failureDetection()
  {
@@ -323,7 +360,7 @@ index ac014af..9ac3577 100755
          return true;
      }
      /*
-@@ -1060,6 +1299,18 @@ void Estimator::optimization()
+@@ -1060,6 +1316,18 @@ void Estimator::optimization()
      TicToc t_whole, t_prepare;
      vector2double();
  
@@ -342,7 +379,7 @@ index ac014af..9ac3577 100755
      ceres::Problem problem;
      ceres::LossFunction *loss_function;
      //loss_function = NULL;
-@@ -1071,7 +1322,26 @@ void Estimator::optimization()
+@@ -1071,7 +1339,37 @@ void Estimator::optimization()
          ceres::Manifold *local_parameterization = new PoseLocalParameterization();
          problem.AddParameterBlock(para_Pose[i], SIZE_POSE, local_parameterization);
          if(USE_IMU)
@@ -359,6 +396,17 @@ index ac014af..9ac3577 100755
 +            // 不存在谁压过谁的问题。
 +            if (is_static)
 +            {
++                // 静止时只冻结【速度】(索引 0..2)。
++                //
++                // 试过连加速度计零偏(索引 3..5)一起冻结 —— 灾难性失败:
++                // 实测 117 帧就发散到 1e84 米。原因是 Ba 是 IMU 残差里必需的
++                // 自由度，冻死它之后残差无论如何都满足不了，优化器直接爆炸。
++                //
++                // 动机本身是对的: 实测静止 5 分钟 Ba 单调涨到 0.4 m/s²，
++                // 对应重力方向偏差 2.3° —— 静止时加速度计零偏与俯仰/横滚
++                // 完全耦合(同一测量既可解释成"有零偏"也可解释成"倾斜了")，
++                // 优化器无从区分，两者一起漂，位置随之线性爬行。
++                // 但正确的处理是给 Ba 加软先验而非硬冻结，这一项尚未实现。
 +                static const std::vector<int> kFixedVel{0, 1, 2};
 +                problem.AddParameterBlock(para_SpeedBias[i], SIZE_SPEEDBIAS,
 +                                          new ceres::SubsetManifold(SIZE_SPEEDBIAS, kFixedVel));
@@ -370,7 +418,7 @@ index ac014af..9ac3577 100755
      }
      if(!USE_IMU)
          problem.SetParameterBlockConstant(para_Pose[0]);
-@@ -1100,18 +1370,48 @@ void Estimator::optimization()
+@@ -1100,18 +1398,48 @@ void Estimator::optimization()
      {
          // construct new marginlization_factor
          MarginalizationFactor *marginalization_factor = new MarginalizationFactor(last_marginalization_info);
@@ -423,7 +471,7 @@ index ac014af..9ac3577 100755
          }
      }
  
-@@ -1137,7 +1437,7 @@ void Estimator::optimization()
+@@ -1137,7 +1465,7 @@ void Estimator::optimization()
                  Vector3d pts_j = it_per_frame.point;
                  ProjectionTwoFrameOneCamFactor *f_td = new ProjectionTwoFrameOneCamFactor(pts_i, pts_j, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocity,
                                                                   it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
@@ -432,7 +480,7 @@ index ac014af..9ac3577 100755
              }
  
              if(STEREO && it_per_frame.is_stereo)
-@@ -1147,18 +1447,37 @@ void Estimator::optimization()
+@@ -1147,18 +1475,37 @@ void Estimator::optimization()
                  {
                      ProjectionTwoFrameTwoCamFactor *f = new ProjectionTwoFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
                                                                   it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
@@ -472,7 +520,7 @@ index ac014af..9ac3577 100755
      }
  
      ROS_DEBUG("visual measurement count: %d", f_m_cnt);
-@@ -1185,9 +1504,111 @@ void Estimator::optimization()
+@@ -1185,9 +1532,111 @@ void Estimator::optimization()
          options.max_solver_time_in_seconds = SOLVER_TIME * 4.0 / 5.0;
      else
          options.max_solver_time_in_seconds = SOLVER_TIME;
@@ -678,10 +726,10 @@ index 71afb67..df061f0 100755
  
 diff --git a/vins/src/factor/zero_motion_factor.h b/vins/src/factor/zero_motion_factor.h
 new file mode 100644
-index 0000000..215f223
+index 0000000..f6e2921
 --- /dev/null
 +++ b/vins/src/factor/zero_motion_factor.h
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,70 @@
 +/*******************************************************
 + * 零运动约束 —— 本项目新增，非上游文件
 + *
@@ -715,8 +763,13 @@ index 0000000..215f223
 +class ZeroMotionFactor : public ceres::SizedCostFunction<3, 7, 7>
 +{
 +  public:
-+    // sigma 取 2mm: 远小于需要抑制的漂移量(实测每帧约 0.5mm、每分钟数百 mm)，
-+    // 又不是硬约束，视觉观测仍能让整体位姿平滑调整。
++    // sigma 取 2mm。实测收紧到 0.2mm 反而略差(1.37cm vs 1.17cm)，
++    // 说明约束强度不是残余漂移的瓶颈。
++    // 早前用 2mm，实测 ZUPT 全程激活、速度精确为 0 的情况下位置仍以约
++    // 0.2~0.5 cm/分钟 缓慢爬行 —— 因为这是【相邻帧】的相对约束，
++    // 单帧残差很小但滑窗反复滑动后会累积。收紧 10 倍以压住累积项。
++    // 仍是软约束，视觉观测依然能让整体位姿平滑调整，不会像硬冻结那样
++    // 把 processIMU 死递推出来的误差锁死(那条路实测更差，见文件头说明)。
 +    static constexpr double SIGMA = 0.002;
 +
 +    virtual bool Evaluate(double const *const *parameters, double *residuals,
@@ -748,7 +801,7 @@ index 0000000..215f223
 +    }
 +};
 diff --git a/vins/src/featureTracker/feature_tracker.cpp b/vins/src/featureTracker/feature_tracker.cpp
-index 3508bc0..4943a5e 100755
+index 3508bc0..ff1a657 100755
 --- a/vins/src/featureTracker/feature_tracker.cpp
 +++ b/vins/src/featureTracker/feature_tracker.cpp
 @@ -356,8 +356,32 @@ map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> FeatureTracker::trackIm
@@ -802,7 +855,34 @@ index 3508bc0..4943a5e 100755
              ids_right = ids;
              reduceVector(cur_right_pts, status);
              reduceVector(ids_right, status);
-@@ -605,7 +639,17 @@ vector<cv::Point2f> FeatureTracker::ptsVelocity(vector<int> &ids, vector<cv::Poi
+@@ -534,6 +568,26 @@ void FeatureTracker::rejectWithF()
+ 
+ void FeatureTracker::readIntrinsicParameter(const vector<string> &calib_file)
+ {
++    // 本地补丁：重复调用时直接返回。
++    //
++    // 上游这里无条件 push_back，从不 clear。正常启动只调用一次，
++    // 所以看不出问题；但本项目恢复了失效检测/代价失控自愈，重置时会再次
++    // 调用 setParameter()，而 setParameter() 里就有这一行。后果有两层:
++    //
++    //   1) m_camera 每重置一次就多 2 个相机 (2 -> 4 -> 6)，与 NUM_OF_CAM 脱节
++    //   2) 【致命】push_back 会让 vector 重新分配缓冲区，而此时
++    //      特征跟踪线程正在并发使用 m_camera[i] —— 读到的是已释放内存里的
++    //      shared_ptr，解引用即野指针 -> 段错误。
++    //
++    // 实测: 每次触发重置后随机崩溃(dmesg 全是 "segfault at 680 error 4")，
++    // 而在 gdb 下因为整体减速反而不复现 —— 典型的竞态特征。
++    //
++    // 这里不能改成 "clear() 再 push_back"，那样窗口期 m_camera 是空的，
++    // 跟踪线程的 m_camera[0] 会直接越界，比原来更糟。内参本来就不会变，
++    // 已加载过就整个跳过才是对的。
++    if (m_camera.size() == calib_file.size())
++        return;
++
+     for (size_t i = 0; i < calib_file.size(); i++)
+     {
+         ROS_INFO("reading paramerter of camera %s", calib_file[i].c_str());
+@@ -605,7 +659,17 @@ vector<cv::Point2f> FeatureTracker::ptsVelocity(vector<int> &ids, vector<cv::Poi
      }
  
      // caculate points velocity

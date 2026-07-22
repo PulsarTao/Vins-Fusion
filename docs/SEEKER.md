@@ -175,6 +175,49 @@ bool Estimator::failureDetection()
 以及**单帧位置跳变** —— 实测抓到过一次「0.893 m → 325.486 m」的单帧突变
 （相邻帧间隔 0.1 s，等于 3255 m/s），是优化器一次灾难性迭代步的结果。
 
+### 3.4b 启用重置后引出的两个上游并发 bug
+
+`failureDetection()` 一恢复，`clearState()`/`setParameter()` 就从「只在启动时跑一次」
+变成了运行时热路径。上游从没在这个前提下写过这两个函数，于是暴露出两个隐藏 bug，
+表现都是 **vins_node 随机段错误**（`[ros2run]: Segmentation fault`）。
+
+**bug 1 — `readIntrinsicParameter()` 无条件 `push_back`（致命）**
+
+```cpp
+// feature_tracker.cpp，上游原文
+for (size_t i = 0; i < calib_file.size(); i++)
+    m_camera.push_back(camera);        // 从不 clear()
+```
+
+`setParameter()` 里会调它。每重置一次 `m_camera` 就多 2 个相机（2→4→6），
+更要命的是 `push_back` 会让 vector **重新分配缓冲区**，而此时
+**特征跟踪线程正在并发使用 `m_camera[i]`** —— 读到已释放内存里的 `shared_ptr`，
+解引用即野指针。
+
+判定手法：`grep -c "reading paramerter" 日志`。启动应当只有 2 次（双目）。
+实测一次重置后变成 4 次，直接坐实。
+
+修法是「已加载过就整个跳过」，**不能**改成 `clear()` 再 `push_back` ——
+那样窗口期 `m_camera` 是空的，跟踪线程 `m_camera[0]` 会直接越界，比原来更糟。
+内参本来就不会变。
+
+**bug 2 — `clearState()` 清队列时锁错了**
+
+`accBuf`/`gyrBuf`/`featureBuf` 由 `inputIMU()`/`inputImage()` 在**其他线程**
+持 `mBuf` 写入，而 `clearState()` 只持 `mProcess` 就去 `pop()` 它们。
+两把不同的锁保护同一份数据 = 数据竞争。修法是补上 `mBuf` 锁。
+
+**排查这类问题的手法（这次真正省时间的部分）**
+
+1. `dmesg | grep segfault` —— 拿到 `segfault at 680 ... error 4 in vins_node[基址+长度]`。
+   `error 4` = 用户态读取未映射页，即空/野指针解引用；六次崩溃 `ip - 基址` 完全相同，
+   说明是单一代码点，不是内存乱写。
+2. `addr2line -Cfie <二进制> <ip-基址>` 定位函数。Release 无 `-g` 时只有函数名，
+   用 `-DCMAKE_BUILD_TYPE=RelWithDebInfo` 重编可拿到行号（仍是 -O2，时序不变）。
+3. **`gdb -batch -ex run` 下跑不出来，本身就是结论**：整体减速掩盖了竞态窗口。
+   实测 gdb 下跑满 180 秒、1751 帧、同样触发过一次重置，安然无恙 ——
+   到这一步就该往「并发」而不是「逻辑」方向查了。
+
 ### 3.5 ZUPT 零速修正
 
 静止时加速度计零偏与重力方向高度耦合、几乎不可观。`patches/0003` 里
@@ -228,6 +271,18 @@ bool Estimator::failureDetection()
 
 > 早前文档里写过「3 分钟数毫米」之类的数字，那些是 `timeout 45` 只跑了
 > 45 秒得出的，却按 5 分钟上报，差了近 7 倍。已按完整时长重测更正。
+
+### 重置路径修复后的回归验证（307 秒完整回放 ×3）
+
+| 次数 | 帧数 | 静止漂移 | 重置次数 | 段错误 | `reading paramerter` |
+|---|---|---|---|---|---|
+| 1 | 3033 | 0.149 m (2.77 cm/分钟) | 0 | 0 | 2 |
+| 2 | 3016 | 0.129 m (2.40 cm/分钟) | 1 | 0 | 2 |
+| 3 | 2730 | 0.121 m (2.49 cm/分钟) | **30** | 0 | 2 |
+
+第 3 次是关键证据：触发了 30 次重置仍然零崩溃，而修复前**一次**重置就足以崩掉。
+`reading paramerter` 恒为 2 说明 `m_camera` 不再增长。
+漂移数值与修复前的已知良好基线（2.3 cm/分钟）一致，确认修复没有引入回归。
 
 ### 尚未解决 / 需要注意
 

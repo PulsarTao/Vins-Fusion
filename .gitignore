@@ -14,6 +14,16 @@ dist/
 # src/seeker1 是指向 ros2_ws_src/seeker1 的软链，源码本体已在版本控制里
 .seeker_ws/
 
+# IMU 标定工作区与中间产物
+# .calib_ws 是 allan_variance_ros 的 clone（上游仓库，同 src_upstream 的理由）；
+# 曲线图和 imu.yaml 是 analysis.py 的输出，标定结论已固化进
+# scripts/gen_seeker_config.py 的噪声参数，无需入库。
+.calib_ws/
+allan_deviation.csv
+acceleration.png
+gyro.png
+imu.yaml
+
 # 运行时输出
 *.log
 output/
